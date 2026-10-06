@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}Train ML - SICCA{% endblock %}
+{% block content %}
+
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;
+              flex-wrap:wrap;gap:15px;margin-bottom:20px">
+    <div>
+      <h1>Machine Learning Training</h1>
+      <p style="color:var(--text-light);margin-top:5px">
+        Train the classifier on labelled CSV data
+      </p>
+    </div>
+    <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Back</a>
+  </div>
+
+  <div style="background:rgba(15,23,42,.5);padding:18px;border-radius:8px;
+              margin-bottom:25px;border-left:4px solid {% if model_available %}#10b981{% else %}#f59e0b{% endif %}">
+    <strong>Model status:</strong>
+    {% if model_available %}
+      <span style="color:#10b981">trained &amp; ready</span>
+    {% else %}
+      <span style="color:#f59e0b">not trained</span>
+    {% endif %}
+    &mdash; at least 20 rows and both classes (0 and 1) are required.
+  </div>
+
+  {% if error %}
+    <div class="flash error">{{ error }}</div>
+  {% endif %}
+
+  <form method="post" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div style="border:2px dashed #60a5fa;border-radius:8px;padding:35px;
+                text-align:center;cursor:pointer;margin-bottom:20px"
+         onclick="document.getElementById('training_file').click()">
+      <input type="file" id="training_file" name="training_file"
+             accept=".csv" style="display:none">
+      <div style="font-size:40px">&#128193;</div>
+      <h3 style="margin-top:10px">Click to upload training CSV</h3>
+      <p style="color:var(--text-light);margin-top:8px;font-size:13px">
+        Columns required: type, status, priority, year, suspects_count,
+        evidence_count, posterior, confidence, label
+      </p>
+      <div id="file-name" style="margin-top:12px;color:#60a5fa;font-weight:500"></div>
+    </div>
+    <button type="submit" class="btn btn-success" style="width:100%">
+      Train Model
+    </button>
+  </form>
+
+  {% if metrics %}
+  <div style="margin-top:30px">
+    <h2 style="color:#10b981">Training Results</h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+                gap:15px;margin-top:20px">
+      <div style="background:rgba(15,23,42,.8);padding:15px;border-radius:6px;text-align:center">
+        <div style="font-size:24px;font-weight:700">
+          {{ "%.3f"|format(metrics.roc_auc) if metrics.roc_auc == metrics.roc_auc else "n/a" }}
+        </div>
+        <div style="font-size:11px;color:var(--text-light);text-transform:uppercase">ROC-AUC</div>
+      </div>
+      <div style="background:rgba(15,23,42,.8);padding:15px;border-radius:6px;text-align:center">
+        <div style="font-size:24px;font-weight:700">{{ "%.1f"|format(metrics.accuracy * 100) }}%</div>
+        <div style="font-size:11px;color:var(--text-light);text-transform:uppercase">Accuracy</div>
+      </div>
+      <div style="background:rgba(15,23,42,.8);padding:15px;border-radius:6px;text-align:center">
+        <div style="font-size:24px;font-weight:700">{{ metrics.training_samples }}</div>
+        <div style="font-size:11px;color:var(--text-light);text-transform:uppercase">Train</div>
+      </div>
+      <div style="background:rgba(15,23,42,.8);padding:15px;border-radius:6px;text-align:center">
+        <div style="font-size:24px;font-weight:700">{{ metrics.test_samples }}</div>
+        <div style="font-size:11px;color:var(--text-light);text-transform:uppercase">Test</div>
+      </div>
+    </div>
+    <div style="margin-top:20px;color:var(--text-light);font-size:13px">
+      <div><strong>Version:</strong> {{ metrics.model_version }}</div>
+      <div><strong>Trained at:</strong> {{ metrics.trained_at }}</div>
+    </div>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+document.getElementById('training_file').addEventListener('change', function(e) {
+  const f = e.target.files[0];
+  const el = document.getElementById('file-name');
+  el.textContent = f ? `Selected: ${f.name} (${(f.size/1024).toFixed(1)} KB)` : '';
+});
+</script>
+{% endblock %}
