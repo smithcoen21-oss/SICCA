@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{% block title %}SICCA{% endblock %}</title>
+<style>
+:root{--primary:#2563eb;--primary-dark:#1d4ed8;--success:#10b981;
+--warning:#f59e0b;--danger:#ef4444;--dark:#0f172a;--dark-light:#1e293b;
+--text:#e2e8f0;--text-light:#94a3b8}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:var(--dark);
+color:var(--text);line-height:1.6}
+a{color:#60a5fa;text-decoration:none}
+a:hover{text-decoration:underline}
+.navbar{background:var(--dark-light);padding:0 20px;border-bottom:1px solid #334155;
+position:sticky;top:0;z-index:1000}
+.nav-container{display:flex;justify-content:space-between;align-items:center;
+max-width:1400px;margin:0 auto;gap:20px}
+.nav-logo{display:flex;align-items:center;padding:15px 0}
+.nav-logo h1{color:#60a5fa;font-size:24px;font-weight:300;margin-left:10px}
+.nav-menu{display:flex;list-style:none;flex-wrap:wrap}
+.nav-item{margin:0 5px}
+.nav-link{display:block;padding:20px 15px;color:#cbd5e1;text-decoration:none;
+font-weight:500;transition:all .3s ease;border-bottom:3px solid transparent}
+.nav-link:hover,.nav-link.active{color:#60a5fa;border-bottom-color:#60a5fa;
+background:rgba(96,165,250,.1);text-decoration:none}
+.user-info{display:flex;align-items:center;gap:12px;color:var(--text-light);font-size:14px}
+.container{max-width:1400px;margin:0 auto;padding:30px 20px}
+.card{background:var(--dark-light);padding:25px;border-radius:10px;
+margin-bottom:20px;border:1px solid #334155}
+.card h2{color:#60a5fa;margin-bottom:15px}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;
+background:var(--primary);color:#fff;text-decoration:none;border-radius:8px;
+font-weight:600;transition:all .3s ease;border:none;cursor:pointer;font-size:14px}
+.btn:hover{background:var(--primary-dark);transform:translateY(-2px);text-decoration:none}
+.btn-secondary{background:#475569}
+.btn-secondary:hover{background:#334155}
+.btn-success{background:var(--success)}
+.btn-success:hover{background:#059669}
+.btn-warning{background:var(--warning)}
+.btn-warning:hover{background:#d97706}
+.btn-danger{background:var(--danger)}
+.btn-danger:hover{background:#dc2626}
+.btn-sm{padding:6px 12px;font-size:12px}
+.flash{padding:12px 16px;margin:15px 0;border-radius:6px}
+.flash.error{background:rgba(239,68,68,.1);color:#fca5a5;border:1px solid rgba(239,68,68,.3)}
+.flash.success{background:rgba(16,185,129,.1);color:#a7f3d0;border:1px solid rgba(16,185,129,.3)}
+.flash.warning{background:rgba(245,158,11,.1);color:#fde68a;border:1px solid rgba(245,158,11,.3)}
+table{width:100%;border-collapse:collapse}
+th,td{padding:12px;text-align:left;border-bottom:1px solid #334155}
+th{background:rgba(15,23,42,.8);color:var(--text-light);font-weight:600;font-size:13px;
+text-transform:uppercase;letter-spacing:.5px}
+tr:hover{background:rgba(96,165,250,.05)}
+label{display:block;margin-bottom:6px;font-weight:600;color:var(--text)}
+.required::after{content:" *";color:var(--danger)}
+input,select,textarea{width:100%;padding:10px;background:rgba(15,23,42,.8);
+border:1px solid #334155;border-radius:6px;color:var(--text);font-size:14px;
+font-family:inherit}
+input:focus,select:focus,textarea:focus{outline:none;border-color:#60a5fa;
+box-shadow:0 0 0 3px rgba(96,165,250,.1)}
+textarea{min-height:120px;resize:vertical}
+.form-group{margin-bottom:20px}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.form-grid .full{grid-column:1/-1}
+.badge{display:inline-block;padding:4px 10px;border-radius:20px;font-size:11px;
+font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.badge-high{background:rgba(239,68,68,.2);color:#fca5a5;border:1px solid rgba(239,68,68,.3)}
+.badge-medium{background:rgba(245,158,11,.2);color:#fde68a;border:1px solid rgba(245,158,11,.3)}
+.badge-low{background:rgba(16,185,129,.2);color:#a7f3d0;border:1px solid rgba(16,185,129,.3)}
+.risk-high{color:#ef4444}
+.risk-medium{color:#f59e0b}
+.risk-low{color:#10b981}
+.footer{margin-top:50px;padding:30px 0;border-top:1px solid #334155;
+color:var(--text-light);font-size:12px;text-align:center}
+</style>
+{% block head_extra %}{% endblock %}
+</head>
+<body>
+<nav class="navbar">
+  <div class="nav-container">
+    <div class="nav-logo">
+      <span style="font-size:24px">&#128269;</span>
+      <h1>SICCA</h1>
+    </div>
+    {% if current_user.is_authenticated %}
+    <ul class="nav-menu">
+      <li class="nav-item"><a class="nav-link" href="{{ url_for('dashboard') }}">Dashboard</a></li>
+      <li class="nav-item"><a class="nav-link" href="{{ url_for('create_case') }}">Create Case</a></li>
+      <li class="nav-item"><a class="nav-link" href="{{ url_for('bulk_upload') }}">Bulk Upload</a></li>
+      <li class="nav-item"><a class="nav-link" href="{{ url_for('network_view') }}">Network</a></li>
+      <li class="nav-item"><a class="nav-link" href="{{ url_for('export_cases') }}">Export</a></li>
+      <li class="nav-item"><a class="nav-link" href="{{ url_for('train_ml_model') }}">Train ML</a></li>
+      <li class="nav-item"><a class="nav-link" href="{{ url_for('how_it_works') }}">How It Works</a></li>
+      {% if current_user.is_admin() %}
+      <li class="nav-item"><a class="nav-link" href="{{ url_for('audit_view') }}">Audit</a></li>
+      {% endif %}
+    </ul>
+    <div class="user-info">
+      <span>{{ current_user.username }}</span>
+      <form method="post" action="{{ url_for('logout') }}" style="display:inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="btn btn-sm btn-secondary">Logout</button>
+      </form>
+    </div>
+    {% endif %}
+  </div>
+</nav>
+
+<div class="container">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for category, message in messages %}
+        <div class="flash {{ category }}">{{ message }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  {% block content %}{% endblock %}
+
+  <div class="footer">
+    <p><strong>Intellectual Property Notice:</strong> This system, including all associated
+    code, architecture, technical specifications, algorithms, and the entire SICCA
+    (Sistema Integrado de Casos Cr&iacute;menes en Archivo) framework, constitutes the
+    exclusive intellectual property of the inventor C.B. Smith.</p>
+    <p>Copyright &copy; 2024 C.B. Smith. All rights reserved worldwide.</p>
+  </div>
+</div>
+</body>
+</html>
