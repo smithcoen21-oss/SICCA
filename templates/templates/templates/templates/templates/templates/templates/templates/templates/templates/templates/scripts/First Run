@@ -1,0 +1,19 @@
+On first run:
+
+sicca_data/sicca.db is created (SQLite).
+
+An admin user is seeded from the environment variables above.
+
+A persistent secret.key is written under sicca_data/.
+
+Directories for logs, uploads, exports and models are created.
+
+Environment variables
+Var	Default	Purpose
+SICCA_BASE_DIR	sicca_data	Data root
+SICCA_HOST	127.0.0.1	Bind address
+SICCA_PORT	5000	Bind port
+SICCA_DEBUG	0	Never enable in production
+SICCA_SECRET_KEY	persisted file	Flask session secret
+SICCA_ADMIN_USER	admin	Seeded on first run
+SICCA_ADMIN_PASS	random	Seeded on first run
