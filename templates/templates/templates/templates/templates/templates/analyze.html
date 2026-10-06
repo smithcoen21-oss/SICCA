@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}Analysis - {{ case.case_id }} - SICCA{% endblock %}
+{% block content %}
+
+{% set h = analysis.hybrid_analysis %}
+{% set b = analysis.bayesian %}
+{% set m = analysis.machine_learning %}
+
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;
+              flex-wrap:wrap;gap:15px;margin-bottom:25px">
+    <div>
+      <h1>Case Analysis</h1>
+      <p style="color:var(--text-light);margin-top:5px">
+        {{ case.case_name }} ({{ case.case_id }})
+      </p>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <a href="{{ url_for('view_case', case_id=case.case_id) }}" class="btn btn-secondary">Back to Case</a>
+      <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Dashboard</a>
+    </div>
+  </div>
+
+  <div style="background:rgba(15,23,42,.5);padding:25px;border-radius:10px;
+              border-left:4px solid #f59e0b">
+    <h2 style="color:#f59e0b;margin-bottom:20px">Hybrid Risk Analysis</h2>
+
+    <div style="font-size:52px;font-weight:800;text-align:center;margin:10px 0"
+         class="risk-{{ h.risk_level }}">
+      {{ "%.1f"|format(h.final_risk_score * 100) }}%
+    </div>
+
+    <div style="text-align:center;margin-bottom:20px">
+      <span class="badge badge-{{ h.risk_level }}"
+            style="font-size:15px;padding:8px 20px">
+        {{ h.risk_level|upper }} RISK
+      </span>
+    </div>
+
+    <div style="background:#334155;height:20px;border-radius:10px;overflow:hidden">
+      <div style="height:100%;border-radius:10px;
+                  background:{% if h.risk_level == 'high' %}linear-gradient(90deg,#ef4444,#f87171){% elif h.risk_level == 'medium' %}linear-gradient(90deg,#f59e0b,#fbbf24){% else %}linear-gradient(90deg,#10b981,#34d399){% endif %};
+                  width:{{ h.final_risk_score * 100 }}%"></div>
+    </div>
+
+    <div style="text-align:center;color:var(--text-light);font-size:13px;margin-top:12px">
+      {{ h.calculation }} &bull; Confidence: {{ h.confidence|upper }}
+    </div>
+  </div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px">
+  <div class="card" style="border-left:4px solid #60a5fa">
+    <h3 style="color:#60a5fa;margin-bottom:15px">Bayesian Analysis</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:15px">
+      <div style="background:rgba(15,23,42,.8);padding:12px;border-radius:6px;text-align:center">
+        <div style="font-size:22px;font-weight:700">{{ "%.3f"|format(b.posterior) }}</div>
+        <div style="font-size:11px;color:var(--text-light);text-transform:uppercase">Posterior</div>
+      </div>
+      <div style="background:rgba(15,23,42,.8);padding:12px;border-radius:6px;text-align:center">
+        <div style="font-size:22px;font-weight:700">{{ "%.3f"|format(b.adjusted_posterior) }}</div>
+        <div style="font-size:11px;color:var(--text-light);text-transform:uppercase">Decay-adj</div>
+      </div>
+      <div style="background:rgba(15,23,42,.8);padding:12px;border-radius:6px;text-align:center">
+        <div style="font-size:22px;font-weight:700">{{ "%.3f"|format(b.confidence) }}</div>
+        <div style="font-size:11px;color:var(--text-light);text-transform:uppercase">Confidence</div>
+      </div>
+      <div style="background:rgba(15,23,42,.8);padding:12px;border-radius:6px;text-align:center">
+        <div style="font-size:22px;font-weight:700">{{ "%.2f"|format(b.evidence_likelihood_ratio) }}</div>
+        <div style="font-size:11px;color:var(--text-light);text-transform:uppercase">Evidence LR</div>
+      </div>
+    </div>
+    <div style="font-size:13px;color:var(--text-light)">
+      <div>Prior: <strong style="color:var(--text)">{{ "%.3f"|format(b.prior_used) }}</strong></div>
+      <div>Base LR: <strong style="color:var(--text)">{{ "%.3f"|format(b.base_likelihood_ratio) }}</strong></div>
+      <div>Risk level: <span class="badge badge-{{ b.risk_level }}">{{ b.risk_level|upper }}</span></div>
+    </div>
+  </div>
+
+  <div class="card" style="border-left:4px solid {% if m.model_available %}#10b981{% else %}#ef4444{% endif %}">
+    <h3 style="color:#10b981;margin-bottom:15px">Machine Learning</h3>
+    {% if m.model_available %}
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:15px">
+        <div style="background:rgba(15,23,42,.8);padding:12px;border-radius:6px;text-align:center">
+          <div style="font-size:22px;font-weight:700">{{ "%.3f"|format(m.probability) }}</div>
+          <div style="font-size:11px;color:var(--text-light);text-transform:uppercase">Probability</div>
+        </div>
+        <div style="background:rgba(15,23,42,.8);padding:12px;border-radius:6px;text-align:center">
+          <div style="font-size:22px;font-weight:700">
+            {{ m.confidence|upper }}
+          </div>
+          <div style="font-size:11px;color:var(--text-light);text-transform:uppercase">Confidence</div>
+        </div>
+      </div>
+      <div style="font-size:13px;color:var(--text-light)">
+        <div>Model version: <strong style="color:var(--text)">{{ m.model_version }}</strong></div>
+        <div>Status: <span style="color:#10b981">trained</span></div>
+      </div>
+    {% else %}
+      <div class="flash warning" style="margin-bottom:12px">
+        ML model unavailable &mdash; score is Bayesian-only.
+      </div>
+      <p style="color:var(--text-light);font-size:13px">{{ m.error }}</p>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <h2>Actionable Insights</h2>
+  <ul style="list-style:none">
+    {% for i in analysis.insights %}
+      <li style="padding:12px 15px;margin:8px 0;background:rgba(15,23,42,.8);
+                 border-radius:6px;border-left:3px solid #60a5fa">{{ i }}</li>
+    {% endfor %}
+  </ul>
+</div>
+
+<div class="card" style="background:rgba(15,23,42,.5)">
+  <h3 style="color:var(--text-light);margin-bottom:10px">Analysis Details</h3>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+              gap:15px;font-size:13px">
+    <div><strong>Analysis ID:</strong> {{ analysis.metadata.analysis_id }}</div>
+    <div><strong>Timestamp:</strong> {{ analysis.metadata.timestamp[:19].replace('T',' ') }}</div>
+    <div><strong>Processing time:</strong> {{ analysis.metadata.analysis_time }} s</div>
+    <div><strong>Model version:</strong> {{ analysis.metadata.model_version }}</div>
+  </div>
+</div>
+{% endblock %}
