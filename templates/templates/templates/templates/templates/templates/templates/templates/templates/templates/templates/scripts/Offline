@@ -1,0 +1,8 @@
+The application does not require any external service to run. The D3 network
+visualisation loads static/d3.v7.min.js locally; you should download the
+minified D3 v7 file from https://d3js.org/d3.v7.min.js and place it in
+static/ before first use of the Network page.
+
+Deploying
+Put the app behind an HTTPS reverse proxy (nginx, Caddy). The app itself
+serves plain HTTP; do not expose it directly to the internet.
