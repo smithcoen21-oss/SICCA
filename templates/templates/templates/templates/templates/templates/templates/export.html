@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Export - SICCA{% endblock %}
+{% block content %}
+
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;
+              flex-wrap:wrap;gap:15px;margin-bottom:20px">
+    <div>
+      <h1>Export Cases</h1>
+      <p style="color:var(--text-light);margin-top:5px">
+        Download case data in CSV, JSON or PDF
+      </p>
+    </div>
+    <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Back</a>
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:20px">
+    <div style="background:rgba(15,23,42,.5);padding:25px;border-radius:8px;text-align:center">
+      <div style="font-size:36px;margin-bottom:10px">&#128202;</div>
+      <h3>CSV</h3>
+      <p style="color:var(--text-light);margin:12px 0;font-size:13px">
+        All cases, tabular. Best for spreadsheets.
+      </p>
+      <a href="{{ url_for('export_single_case', case_id='all', format_type='csv') }}"
+         class="btn btn-success">Download CSV</a>
+    </div>
+    <div style="background:rgba(15,23,42,.5);padding:25px;border-radius:8px;text-align:center">
+      <div style="font-size:36px;margin-bottom:10px">&#128196;</div>
+      <h3>JSON</h3>
+      <p style="color:var(--text-light);margin:12px 0;font-size:13px">
+        Structured, integration-friendly.
+      </p>
+      <a href="{{ url_for('export_single_case', case_id='all', format_type='json') }}"
+         class="btn btn-warning">Download JSON</a>
+    </div>
+    <div style="background:rgba(15,23,42,.5);padding:25px;border-radius:8px;text-align:center">
+      <div style="font-size:36px;margin-bottom:10px">&#128220;</div>
+      <h3>PDF</h3>
+      <p style="color:var(--text-light);margin:12px 0;font-size:13px">
+        Printable report. Requires wkhtmltopdf on the server.
+      </p>
+      <a href="{{ url_for('export_single_case', case_id='all', format_type='pdf') }}"
+         class="btn">Download PDF</a>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Export Individual Cases</h2>
+  {% if cases %}
+  <table>
+    <thead><tr><th>Case ID</th><th>Name</th><th>Type</th><th>Status</th><th>Actions</th></tr></thead>
+    <tbody>
+      {% for c in cases %}
+      <tr>
+        <td><strong>{{ c.case_id }}</strong></td>
+        <td>{{ c.case_name }}</td>
+        <td>{{ c.type|title }}</td>
+        <td>{{ c.status|title }}</td>
+        <td>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <a href="{{ url_for('export_single_case', case_id=c.case_id, format_type='csv') }}" class="btn btn-sm btn-success">CSV</a>
+            <a href="{{ url_for('export_single_case', case_id=c.case_id, format_type='json') }}" class="btn btn-sm btn-warning">JSON</a>
+            <a href="{{ url_for('export_single_case', case_id=c.case_id, format_type='pdf') }}" class="btn btn-sm">PDF</a>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color:var(--text-light)">No cases to export.</p>
+  {% endif %}
+</div>
+{% endblock %}
