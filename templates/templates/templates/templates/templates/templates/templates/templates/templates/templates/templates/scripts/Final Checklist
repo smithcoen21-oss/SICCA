@@ -1,0 +1,6 @@
+1. Create `static/d3.v7.min.js` by downloading the D3 v7 bundle (or leave it; the Network page just won't render).
+2. `python -m venv .venv && source .venv/bin/activate`
+3. `pip install -r requirements.txt`
+4. `export SICCA_ADMIN_USER=admin && export SICCA_ADMIN_PASS='...'`
+5. `python sicca_app.py`
+6. Open `http://127.0.0.1:5000`, log in with the seeded credentials
