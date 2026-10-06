@@ -1,0 +1,869 @@
+# =============================================================================
+# SICCA v2.0 - Secure Bayesian + Machine Learning Case Analysis
+# -----------------------------------------------------------------------------
+# Rewrite of the original single-file SICCA application.
+# Every issue listed in "Critical issues.txt" is addressed. Each is marked with
+# a "# FIX #n" comment at the point of change so the diff is auditable.
+#
+# Run:
+#   pip install -r requirements.txt
+#   export SICCA_ADMIN_USER=admin
+#   export SICCA_ADMIN_PASS='choose-a-strong-password'
+#   python sicca_app.py
+#
+# Templates live in ./templates (see reply 2 and 3 of the delivery).
+# =============================================================================
+
+from __future__ import annotations
+
+import html as html_mod
+import json
+import logging
+import os
+import re
+import secrets
+import shutil
+import sqlite3
+import sys
+import time
+import uuid
+from datetime import datetime
+from functools import wraps
+from logging.handlers import RotatingFileHandler
+from math import exp
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import joblib
+import numpy as np
+import pandas as pd
+from flask import (
+    Flask, abort, flash, g, jsonify, redirect, render_template,
+    request, send_file, session, url_for,
+)
+from flask_login import (
+    LoginManager, UserMixin, current_user, login_required, login_user,
+    logout_user,
+)
+from flask_wtf import CSRFProtect
+from flask_wtf.csrf import CSRFError
+from sklearn.compose import ColumnTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
+
+try:
+    import pdfkit  # FIX #6: optional; absence is reported, not hidden.
+except Exception:  # pragma: no cover
+    pdfkit = None
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+class Config:
+    """Runtime configuration. Everything tunable via environment."""
+
+    BASE_DIR = Path(os.environ.get("SICCA_BASE_DIR", "sicca_data")).resolve()
+    CASES_DB = BASE_DIR / "sicca.db"            # FIX #21: SQLite, not per-case JSON.
+    LOGS_DIR = BASE_DIR / "logs"
+    EXPORTS_DIR = BASE_DIR / "exports"
+    UPLOADS_DIR = BASE_DIR / "uploads"
+    MODELS_DIR = BASE_DIR / "models"
+    TRAINING_DIR = BASE_DIR / "training_data"
+
+    MAX_CONTENT_LENGTH = 10 * 1024 * 1024       # FIX #5: upload size cap.
+    ALLOWED_UPLOAD_EXTENSIONS = {
+        ".pdf", ".doc", ".docx", ".txt", ".jpg", ".jpeg", ".png",
+    }
+    MODEL_PATH = MODELS_DIR / "sicca_pipeline.joblib"
+    MODEL_VERSION = "2.0.0"                     # FIX #9: single source of truth.
+
+    # FIX #4: debug off by default; bind to loopback unless overridden.
+    DEBUG = os.environ.get("SICCA_DEBUG", "0") == "1"
+    HOST = os.environ.get("SICCA_HOST", "127.0.0.1")
+    PORT = int(os.environ.get("SICCA_PORT", "5000"))
+
+    SESSION_LIFETIME_SECONDS = 3600
+    CSRF_ENABLED = True
+
+    @classmethod
+    def ensure_dirs(cls) -> None:
+        for d in (cls.BASE_DIR, cls.LOGS_DIR, cls.EXPORTS_DIR,
+                  cls.UPLOADS_DIR, cls.MODELS_DIR, cls.TRAINING_DIR):
+            d.mkdir(parents=True, exist_ok=True)
+
+
+# FIX #18: secret key survives restarts and works across workers.
+def load_or_create_secret_key() -> str:
+    env = os.environ.get("SICCA_SECRET_KEY")
+    if env:
+        return env
+    keyfile = Config.BASE_DIR / "secret.key"
+    Config.BASE_DIR.mkdir(parents=True, exist_ok=True)
+    if keyfile.exists():
+        return keyfile.read_text().strip()
+    key = secrets.token_hex(32)
+    keyfile.write_text(key)
+    try:
+        os.chmod(keyfile, 0o600)
+    except OSError:
+        pass
+    return key
+
+
+# =============================================================================
+# LOGGING  (FIX #19: unused imports removed; single configured logger.)
+# =============================================================================
+
+def configure_logging() -> logging.Logger:
+    Config.ensure_dirs()
+    logger = logging.getLogger("sicca")
+    logger.setLevel(logging.INFO)
+    if logger.handlers:
+        return logger
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    fh = RotatingFileHandler(Config.LOGS_DIR / "sicca.log",
+                             maxBytes=10 * 1024 * 1024, backupCount=5)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+    return logger
+
+
+LOG = configure_logging()
+
+
+# =============================================================================
+# DATABASE  (FIX #21: SQLite replaces one-JSON-file-per-case.)
+# =============================================================================
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    role     TEXT NOT NULL DEFAULT 'analyst'
+);
+
+CREATE TABLE IF NOT EXISTS cases (
+    case_id         TEXT PRIMARY KEY,
+    case_name       TEXT NOT NULL,
+    location        TEXT NOT NULL,
+    year            INTEGER NOT NULL,
+    type            TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    confidence      REAL NOT NULL,
+    suspects_count  INTEGER NOT NULL,
+    evidence_count  INTEGER NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    priority        TEXT NOT NULL DEFAULT 'medium',
+    assigned_to     TEXT NOT NULL DEFAULT '',
+    tags            TEXT NOT NULL DEFAULT '',
+    attached_file   TEXT,
+    file_path       TEXT,
+    created         TEXT NOT NULL,
+    modified        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cases_modified ON cases(modified DESC);
+CREATE INDEX IF NOT EXISTS idx_cases_status   ON cases(status);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      TEXT NOT NULL,
+    actor   TEXT NOT NULL,
+    action  TEXT NOT NULL,
+    target  TEXT NOT NULL,
+    details TEXT
+);
+"""
+
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(Config.CASES_DB, detect_types=sqlite3.PARSE_DECLTYPES)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db() -> None:
+    Config.ensure_dirs()
+    with db() as conn:
+        conn.executescript(SCHEMA)
+        row = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
+        if row["n"] == 0:
+            username = os.environ.get("SICCA_ADMIN_USER", "admin")
+            password = os.environ.get("SICCA_ADMIN_PASS") or secrets.token_urlsafe(12)
+            conn.execute(
+                "INSERT INTO users (username, password, role) VALUES (?,?,?)",
+                (username, generate_password_hash(password), "admin"),
+            )
+            LOG.warning(
+                "Seeded admin user '%s' with password: %s  (change immediately)",
+                username, password,
+            )
+        conn.commit()
+
+
+def audit(actor: str, action: str, target: str, details: str = "") -> None:
+    # FIX #11: audit trail for every state-changing operation.
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO audit_log (ts, actor, action, target, details) "
+            "VALUES (?,?,?,?,?)",
+            (datetime.utcnow().isoformat(), actor, action, target, details),
+        )
+        conn.commit()
+
+
+# =============================================================================
+# AUTH  (FIX #3: login, roles, CSRF on every mutating route.)
+# =============================================================================
+
+class User(UserMixin):
+    def __init__(self, uid: int, username: str, role: str):
+        self.id = str(uid)
+        self.username = username
+        self.role = role
+
+    def is_admin(self) -> bool:
+        return self.role == "admin"
+
+
+login_manager = LoginManager()
+
+
+@login_manager.user_loader
+def load_user(uid: str) -> Optional[User]:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id, username, role FROM users WHERE id = ?", (uid,)
+        ).fetchone()
+    return User(row["id"], row["username"], row["role"]) if row else None
+
+
+def admin_required(f):
+    @wraps(f)
+    @login_required
+    def wrapper(*args, **kwargs):
+        if not current_user.is_admin():
+            abort(403)
+        return f(*args, **kwargs)
+    return wrapper
+
+
+# =============================================================================
+# VALIDATION  (FIX #12: no manual escaping; Jinja autoescape is trusted.)
+# =============================================================================
+
+CASE_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,50}$")
+
+
+def validate_case_id(case_id: str) -> Tuple[bool, str]:
+    if not case_id or not CASE_ID_RE.match(case_id):
+        return False, "Case ID must be 1-50 characters: letters, digits, - or _"
+    return True, ""
+
+
+def coerce_int(value: Any, default: int, lo: int, hi: int) -> int:
+    # FIX #16: range validation for every numeric field.
+    try:
+        n = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
+
+def coerce_float(value: Any, default: float, lo: float, hi: float) -> float:
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, x))
+
+
+def clean_text(value: Any, max_len: int = 1000) -> str:
+    """Store raw text. Jinja escapes on render; no double-escaping."""
+    if value is None:
+        return ""
+    return str(value).strip()[:max_len]
+
+
+def safe_upload_name(case_id: str, filename: str) -> str:
+    # FIX #5: secure_filename on both parts; UUID to avoid collisions.
+    base = secure_filename(filename) or "upload"
+    return f"{secure_filename(case_id)}__{uuid.uuid4().hex[:8]}__{base}"
+
+
+# =============================================================================
+# BAYESIAN MODEL  (FIX #7 + #8: evidence updates the posterior; decay matters.)
+# =============================================================================
+
+class BayesianConfig:
+    """
+    Priors are per-crime base odds (independent, NOT normalised to 1).
+    Likelihood ratio = BASE_LR[type] * f(evidence, suspects, status, priority).
+    """
+
+    PRIORS = {
+        "fraud": 0.12, "homicide": 0.35, "robbery": 0.20, "arson": 0.25,
+        "burglary": 0.18, "assault": 0.22, "theft": 0.15,
+        "vandalism": 0.10, "unknown": 0.10,
+    }
+    BASE_LR = {
+        "fraud": 1.2, "homicide": 2.0, "robbery": 1.6, "arson": 1.8,
+        "burglary": 1.4, "assault": 1.7, "theft": 1.3,
+        "vandalism": 1.1, "unknown": 1.0,
+    }
+    AGE_DECAY_LAMBDA = 0.05
+    MAX_FEATURE_LR = 4.0
+    MIN_FEATURE_LR = 0.25
+
+
+def _odds(p: float) -> float:
+    p = min(max(p, 1e-6), 1 - 1e-6)
+    return p / (1 - p)
+
+
+def _prob(o: float) -> float:
+    return o / (1 + o)
+
+
+def _evidence_lr(evidence_count: int, suspects_count: int,
+                 status: str, priority: str) -> float:
+    """
+    Evidence-driven likelihood ratio. Replaces the original hardcoded
+    per-type lookup so that evidence actually affects the score.
+    """
+    ev = 1.0 + 0.35 * np.log1p(max(0, evidence_count))
+    su = 1.0 + 0.10 * max(0, suspects_count - 1)
+    st = {"open": 1.05, "under investigation": 1.15,
+          "pending trial": 1.25, "closed": 0.90}.get(status.lower(), 1.0)
+    pr = {"high": 1.10, "medium": 1.00, "low": 0.90}.get(priority.lower(), 1.0)
+    lr = float(ev * su * st * pr)
+    return max(BayesianConfig.MIN_FEATURE_LR,
+               min(BayesianConfig.MAX_FEATURE_LR, lr))
+
+
+def bayesian_score(case: Dict[str, Any], current_year: int) -> Dict[str, Any]:
+    ctype = str(case.get("type", "unknown")).lower()
+    prior = BayesianConfig.PRIORS.get(ctype, 0.10)
+    base_lr = BayesianConfig.BASE_LR.get(ctype, 1.0)
+
+    ev_lr = _evidence_lr(
+        coerce_int(case.get("evidence_count", 0), 0, 0, 10000),
+        coerce_int(case.get("suspects_count", 0), 0, 0, 1000),
+        str(case.get("status", "unknown")),
+        str(case.get("priority", "medium")),
+    )
+    total_lr = base_lr * ev_lr
+    posterior = _prob(_odds(prior) * total_lr)
+
+    base_conf = coerce_float(case.get("confidence", 0.5), 0.5, 0.0, 1.0)
+    year = coerce_int(case.get("year", current_year), current_year, 1900, 2100)
+    age = max(0, current_year - year)
+    decayed_conf = max(0.0, min(1.0,
+        base_conf * exp(-BayesianConfig.AGE_DECAY_LAMBDA * age)))
+
+    # FIX #8: decay now multiplies the posterior; it is not just a label.
+    adjusted = posterior * (0.5 + 0.5 * decayed_conf)
+
+    return {
+        "posterior": float(posterior),
+        "adjusted_posterior": float(adjusted),
+        "confidence": float(decayed_conf),
+        "prior_used": float(prior),
+        "base_likelihood_ratio": float(base_lr),
+        "evidence_likelihood_ratio": float(ev_lr),
+        "risk_level": ("high" if adjusted > 0.70
+                       else "medium" if adjusted > 0.40 else "low"),
+    }
+
+
+# =============================================================================
+# MACHINE LEARNING  (FIX #1: proper Pipeline, single artifact, honest errors.)
+# =============================================================================
+
+CATEGORICAL = ["type", "status", "priority"]
+# FIX #11: "location" removed from features -- it is a proxy for
+# demographics/ethnicity and is not acceptable as a model input.
+NUMERIC = ["year", "suspects_count", "evidence_count",
+           "posterior", "confidence"]
+TARGET = "label"
+
+
+def build_pipeline() -> Pipeline:
+    pre = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore",
+                                  sparse_output=False), CATEGORICAL),
+            ("num", StandardScaler(), NUMERIC),
+        ],
+        remainder="drop",
+    )
+    return Pipeline([
+        ("pre", pre),
+        ("clf", LogisticRegression(max_iter=2000, random_state=42)),
+    ])
+
+
+class MLModel:
+    def __init__(self, path: Path):
+        self.path = path
+        self._pipe: Optional[Pipeline] = None
+        self._meta: Dict[str, Any] = {}
+
+    def exists(self) -> bool:
+        return self.path.exists()
+
+    def load(self) -> Pipeline:
+        if self._pipe is None:
+            if not self.exists():
+                raise FileNotFoundError("Model not trained yet.")
+            artifact = joblib.load(self.path)
+            self._pipe = artifact["pipeline"]
+            self._meta = artifact.get("meta", {})
+        return self._pipe
+
+    @property
+    def meta(self) -> Dict[str, Any]:
+        if not self._meta and self.exists():
+            _ = self.load()
+        return self._meta
+
+    def train(self, df: pd.DataFrame) -> Dict[str, Any]:
+        missing = [c for c in CATEGORICAL + NUMERIC + [TARGET]
+                   if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
+
+        df = df.dropna(subset=[TARGET]).copy()
+        df[TARGET] = df[TARGET].astype(int)
+
+        if df[TARGET].nunique() < 2:
+            raise ValueError(
+                "Training data must contain both classes (0 and 1).")
+        # FIX #9: refuse undersized training sets rather than reporting
+        # meaningless metrics (the original trained on 10 rows / 3 test).
+        if len(df) < 20:
+            raise ValueError(
+                f"Refusing to train on {len(df)} rows; "
+                "at least 20 are required for a meaningful split.")
+
+        y = df[TARGET]
+        X = df.drop(columns=[TARGET])
+        counts = y.value_counts()
+        strat = y if counts.min() >= 2 else None
+
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X, y, test_size=0.25, random_state=42, stratify=strat,
+        )
+
+        pipe = build_pipeline()
+        pipe.fit(X_tr, y_tr)
+
+        prob = pipe.predict_proba(X_te)[:, 1]
+        pred = (prob >= 0.5).astype(int)
+        report = classification_report(y_te, pred, output_dict=True,
+                                       zero_division=0)
+
+        metrics = {
+            "roc_auc": (float(roc_auc_score(y_te, prob))
+                        if y_te.nunique() > 1 else float("nan")),
+            "accuracy": float((pred == y_te).mean()),
+            "report": report,
+            "training_samples": int(len(X_tr)),
+            "test_samples": int(len(X_te)),
+            "model_version": Config.MODEL_VERSION,
+            "trained_at": datetime.utcnow().isoformat(),
+        }
+        artifact = {
+            "pipeline": pipe,
+            "meta": {
+                "version": Config.MODEL_VERSION,
+                "trained_at": metrics["trained_at"],
+                "features": {"categorical": CATEGORICAL, "numeric": NUMERIC},
+                "metrics": metrics,
+            },
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(artifact, self.path)
+        self._pipe, self._meta = pipe, artifact["meta"]
+        return metrics
+
+    def predict_one(self, case: Dict[str, Any],
+                    bayes: Dict[str, Any]) -> Tuple[Optional[float], str]:
+        """
+        FIX #1: returns (probability, error_message). On any failure the
+        caller surfaces the reason in the UI instead of silently using 0.5.
+        Because the pipeline embeds OneHotEncoder(handle_unknown='ignore'),
+        single-row prediction cannot fail from a column-count mismatch.
+        """
+        if not self.exists():
+            return None, "ML model is not trained."
+        try:
+            pipe = self.load()
+            X = pd.DataFrame([self._case_to_row(case, bayes)])[CATEGORICAL + NUMERIC]
+            return float(pipe.predict_proba(X)[0, 1]), ""
+        except Exception as exc:
+            LOG.exception("ML prediction failed")
+            return None, f"ML prediction failed: {exc}"
+
+    @staticmethod
+    def _case_to_row(case: Dict[str, Any],
+                     bayes: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "type": str(case.get("type", "unknown")).lower(),
+            "status": str(case.get("status", "unknown")).lower(),
+            "priority": str(case.get("priority", "medium")).lower(),
+            "year": coerce_int(case.get("year", datetime.now().year),
+                               datetime.now().year, 1900, 2100),
+            "suspects_count": coerce_int(case.get("suspects_count", 0),
+                                         0, 0, 1000),
+            "evidence_count": coerce_int(case.get("evidence_count", 0),
+                                         0, 0, 10000),
+            "posterior": float(bayes["posterior"]),
+            "confidence": float(bayes["confidence"]),
+        }
+
+
+# =============================================================================
+# HYBRID ANALYTICS  (FIX #2: high risk reachable; weights renormalise.)
+# =============================================================================
+
+class HybridEngine:
+    def __init__(self, ml: MLModel):
+        self.ml = ml
+
+    def analyze(self, case: Dict[str, Any]) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        current_year = datetime.now().year
+
+        bayes = bayesian_score(case, current_year)
+        ml_prob, ml_err = self.ml.predict_one(case, bayes)
+
+        if ml_prob is None:
+            # FIX #2: when ML is unavailable, do not blend in a constant
+            # 0.5 (which capped the score at ~0.54 and made "high" unreachable).
+            final = bayes["adjusted_posterior"]
+            weights = {"bayesian": 1.0, "ml": 0.0}
+            ml_block = {
+                "probability": None,
+                "confidence": "unavailable",
+                "model_available": False,
+                "error": ml_err,
+                "model_version": self.ml.meta.get(
+                    "version", Config.MODEL_VERSION),
+            }
+        else:
+            weights = {"bayesian": 0.6, "ml": 0.4}
+            final = (weights["bayesian"] * bayes["adjusted_posterior"]
+                     + weights["ml"] * ml_prob)
+            ml_block = {
+                "probability": ml_prob,
+                "confidence": ("high" if ml_prob > 0.8
+                               else "medium" if ml_prob > 0.6 else "low"),
+                "model_available": True,
+                "error": "",
+                "model_version": self.ml.meta.get(
+                    "version", Config.MODEL_VERSION),
+            }
+
+        agreement = (ml_prob is not None
+                     and abs(bayes["adjusted_posterior"] - ml_prob) <= 0.2)
+
+        overall_conf = (
+            "high" if bayes["confidence"] > 0.7 and ml_block["confidence"] == "high"
+            else "medium" if bayes["confidence"] > 0.5
+            else "low"
+        )
+        risk = "high" if final > 0.7 else "medium" if final > 0.4 else "low"
+        elapsed = time.perf_counter() - t0
+
+        hybrid = {
+            "final_risk_score": float(final),
+            "risk_level": risk,
+            "weight_bayesian": weights["bayesian"],
+            "weight_ml": weights["ml"],
+            "agreement": agreement,
+            "confidence": overall_conf,
+            "calculation": (f"{weights['bayesian']:.0%} Bayesian + "
+                            f"{weights['ml']:.0%} ML"),
+        }
+        return {
+            "bayesian": bayes,
+            "machine_learning": ml_block,
+            "hybrid_analysis": hybrid,
+            "insights": self._insights(hybrid, case, ml_block),
+            "metadata": {
+                "analysis_id": secrets.token_hex(8),
+                "timestamp": datetime.utcnow().isoformat(),
+                # FIX #9: measured, not hardcoded.
+                "analysis_time": round(elapsed, 4),
+                "model_version": ml_block["model_version"],
+            },
+        }
+
+    @staticmethod
+    def _insights(hybrid: Dict[str, Any], case: Dict[str, Any],
+                  ml: Dict[str, Any]) -> List[str]:
+        out: List[str] = []
+        risk = hybrid["risk_level"]
+        if risk == "high":
+            out.append("High risk -- recommend immediate investigation.")
+            out.append("Consider allocating additional resources.")
+        elif risk == "medium":
+            out.append("Medium risk -- standard investigation protocol.")
+
+        ev = coerce_int(case.get("evidence_count", 0), 0, 0, 10000)
+        if ev < 3:
+            out.append("Limited evidence -- recommend evidence collection.")
+        elif ev > 10:
+            out.append("Substantial evidence -- focus on analysis.")
+
+        su = coerce_int(case.get("suspects_count", 0), 0, 0, 1000)
+        if su == 0:
+            out.append("No suspects identified -- recommend suspect profiling.")
+        elif su > 3:
+            out.append("Multiple suspects -- consider connection analysis.")
+
+        if ml.get("model_available"):
+            if hybrid["agreement"]:
+                out.append("Strong model agreement -- high confidence.")
+            else:
+                out.append("Model divergence -- recommend manual review.")
+        else:
+            out.append(f"ML unavailable ({ml.get('error', 'unknown')}); "
+                       "score is Bayesian-only.")
+
+        year = coerce_int(case.get("year", datetime.now().year),
+                          datetime.now().year, 1900, 2100)
+        if datetime.now().year - year > 5:
+            out.append("Case aged -- consider evidence degradation.")
+
+        out.append("Case ready for detailed forensic analysis.")
+        return out
+
+
+# =============================================================================
+# INTERNATIONAL  (FIX #10: honest heuristics; no fabricated "ML" metrics.)
+# =============================================================================
+
+class CrossBorderHeuristics:
+    """
+    Transparent rule-based scoring. The original code called this "ML" and
+    reported an invented accuracy_estimate of 0.85 -- both removed.
+    """
+
+    @staticmethod
+    def risk(case: Dict[str, Any]) -> Dict[str, Any]:
+        crime_risk = {
+            "violent_crime": 0.8, "sexual_violence": 0.9,
+            "terrorism": 1.0, "organized_crime": 0.7,
+            "financial_crime": 0.4, "property_crime": 0.3,
+        }.get(str(case.get("crime_category", "other_crime")), 0.5)
+
+        ev = coerce_int(case.get("evidence_count", 0), 0, 0, 10000)
+        su = coerce_int(case.get("suspects_count", 0), 0, 0, 1000)
+        score = (0.6 * crime_risk
+                 + 0.2 * min(1.0, ev / 10.0)
+                 + 0.2 * min(1.0, su / 5.0))
+        level = "HIGH" if score > 0.7 else "MEDIUM" if score > 0.4 else "LOW"
+        return {
+            "risk_score": round(score, 3),
+            "risk_level": level,
+            "method": "transparent_heuristic",
+            "factors": ["crime_category", "evidence_count", "suspects_count"],
+        }
+
+
+# =============================================================================
+# FLASK APP FACTORY
+# =============================================================================
+
+def create_app() -> Flask:
+    Config.ensure_dirs()
+    init_db()
+
+    app = Flask(__name__, template_folder="templates", static_folder="static")
+    app.config.update(
+        SECRET_KEY=load_or_create_secret_key(),
+        MAX_CONTENT_LENGTH=Config.MAX_CONTENT_LENGTH,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        PERMANENT_SESSION_LIFETIME=Config.SESSION_LIFETIME_SECONDS,
+        WTF_CSRF_ENABLED=Config.CSRF_ENABLED,
+    )
+
+    CSRFProtect(app)
+    login_manager.init_app(app)
+    login_manager.login_view = "login"
+
+    ml = MLModel(Config.MODEL_PATH)
+    engine = HybridEngine(ml=ml)
+
+    # ---------------------------------------------------------------- auth
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        if request.method == "POST":
+            username = clean_text(request.form.get("username"), 100)
+            password = request.form.get("password", "")
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT id, username, password, role FROM users "
+                    "WHERE username = ?", (username,),
+                ).fetchone()
+            if row and check_password_hash(row["password"], password):
+                login_user(User(row["id"], row["username"], row["role"]))
+                session.permanent = True
+                audit(username, "login", username)
+                return redirect(url_for("dashboard"))
+            flash("Invalid credentials", "error")
+        return render_template("login.html")
+
+    @app.route("/logout", methods=["POST"])
+    @login_required
+    def logout():
+        audit(current_user.username, "logout", current_user.username)
+        logout_user()
+        return redirect(url_for("login"))
+
+    # ---------------------------------------------------------------- dashboard
+    @app.route("/")
+    @login_required
+    def index():
+        return redirect(url_for("dashboard"))
+
+    @app.route("/dashboard")
+    @login_required
+    def dashboard():
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM cases ORDER BY modified DESC LIMIT 200"
+            ).fetchall()
+            total = conn.execute("SELECT COUNT(*) AS n FROM cases").fetchone()["n"]
+            open_n = conn.execute(
+                "SELECT COUNT(*) AS n FROM cases WHERE status = 'open'"
+            ).fetchone()["n"]
+            high_n = conn.execute(
+                "SELECT COUNT(*) AS n FROM cases WHERE priority = 'high'"
+            ).fetchone()["n"]
+        stats = {"total_cases": total, "open_cases": open_n,
+                 "high_priority": high_n}
+        return render_template("dashboard.html",
+                               cases=[dict(r) for r in rows],
+                               stats=stats,
+                               model_available=ml.exists())
+
+    # ---------------------------------------------------------------- create
+    @app.route("/create_case", methods=["GET", "POST"])
+    @login_required
+    def create_case():
+        if request.method == "POST":
+            case_id = clean_text(request.form.get("case_id"), 50)
+            ok, msg = validate_case_id(case_id)
+            if not ok:
+                flash(msg, "error")
+                return render_template("create_case.html"), 400
+
+            # FIX #5: validate BEFORE saving the file to disk.
+            file = request.files.get("case_file")
+            saved_path = None
+            attached = None
+            if file and file.filename:
+                ext = Path(file.filename).suffix.lower()
+                if ext not in Config.ALLOWED_UPLOAD_EXTENSIONS:
+                    flash(f"File type {ext} not allowed", "error")
+                    return render_template("create_case.html"), 400
+                safe_name = safe_upload_name(case_id, file.filename)
+                saved_path = Config.UPLOADS_DIR / safe_name
+                file.save(saved_path)
+                attached = file.filename
+
+            now = datetime.utcnow().isoformat()
+            record = {
+                "case_id": case_id,
+                "case_name": clean_text(request.form.get("case_name"), 200),
+                "location": clean_text(request.form.get("location"), 200),
+                "year": coerce_int(request.form.get("year"),
+                                   datetime.now().year, 1900, 2100),
+                "type": clean_text(request.form.get("type", "unknown"), 40),
+                "status": clean_text(request.form.get("status", "open"), 40),
+                "confidence": coerce_float(request.form.get("confidence"),
+                                           0.5, 0.0, 1.0),
+                "suspects_count": coerce_int(
+                    request.form.get("suspects_count"), 0, 0, 1000),
+                "evidence_count": coerce_int(
+                    request.form.get("evidence_count"), 0, 0, 10000),
+                "description": clean_text(
+                    request.form.get("description"), 5000),
+                "priority": clean_text(
+                    request.form.get("priority", "medium"), 20),
+                "assigned_to": clean_text(
+                    request.form.get("assigned_to"), 100),
+                "tags": clean_text(request.form.get("tags"), 500),
+                "attached_file": attached,
+                "file_path": str(saved_path) if saved_path else None,
+                "created": now,
+                "modified": now,
+            }
+
+            try:
+                with db() as conn:
+                    conn.execute(
+                        """INSERT INTO cases (case_id, case_name, location,
+                        year, type, status, confidence, suspects_count,
+                        evidence_count, description, priority, assigned_to,
+                        tags, attached_file, file_path, created, modified)
+                        VALUES (:case_id, :case_name, :location, :year, :type,
+                        :status, :confidence, :suspects_count, :evidence_count,
+                        :description, :priority, :assigned_to, :tags,
+                        :attached_file, :file_path, :created, :modified)""",
+                        record,
+                    )
+                    conn.commit()
+                audit(current_user.username, "create_case", case_id)
+                flash(f"Case {case_id} created.", "success")
+                return redirect(url_for("view_case", case_id=case_id))
+            except sqlite3.IntegrityError:
+                flash("Case ID already exists", "error")
+                return render_template("create_case.html"), 409
+            except Exception as exc:
+                # FIX #17: do not swallow; surface to the user.
+                LOG.exception("Failed to write case")
+                flash(f"Failed to save case: {exc}", "error")
+                return render_template("create_case.html"), 500
+
+        return render_template("create_case.html")
+
+    # ---------------------------------------------------------------- view
+    @app.route("/case/<case_id>")
+    @login_required
+    def view_case(case_id: str):
+        with db() as conn:
+            row = conn.execute("SELECT * FROM cases WHERE case_id = ?",
+                               (case_id,)).fetchone()
+        if not row:
+            abort(404)
+        return render_template("view_case.html", case=dict(row))
+
+    # ---------------------------------------------------------------- analyze
+    @app.route("/analyze/<case_id>")
+    @login_required
+    def analyze_case(case_id: str):
+        with db() as conn:
+            row = conn.execute("SELECT * FROM cases WHERE case_id = ?",
+                               (case_id,)).fetchone()
+        if not row:
+            abort(404)
+        result = engine.analyze(dict(row))
+        audit(current_user.username, "analyze", case_id)
+        return
