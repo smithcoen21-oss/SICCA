@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block title %}Create Case - SICCA{% endblock %}
+{% block content %}
+
+<div class="card" style="max-width:900px;margin:0 auto">
+  <h1 style="margin-bottom:10px">Create New Case</h1>
+  <p style="color:var(--text-light);margin-bottom:30px">
+    Fields marked <span style="color:var(--danger)">*</span> are required.
+    Case ID must be 1&ndash;50 characters, letters/digits/hyphen/underscore.
+  </p>
+
+  <form method="post" enctype="multipart/form-data" id="caseForm">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+    <div class="form-grid">
+      <div class="form-group">
+        <label for="case_id" class="required">Case ID</label>
+        <input type="text" id="case_id" name="case_id" required maxlength="50"
+               pattern="[A-Za-z0-9_\-]{1,50}" placeholder="C001-2024">
+        <small style="color:var(--text-light)">Letters, numbers, - and _ only</small>
+      </div>
+
+      <div class="form-group">
+        <label for="case_name" class="required">Case Name</label>
+        <input type="text" id="case_name" name="case_name" required maxlength="200"
+               placeholder="Serial Burglary Investigation">
+      </div>
+
+      <div class="form-group">
+        <label for="location" class="required">Location</label>
+        <input type="text" id="location" name="location" required maxlength="200"
+               placeholder="Downtown District">
+      </div>
+
+      <div class="form-group">
+        <label for="year" class="required">Year</label>
+        <input type="number" id="year" name="year" required min="1900" max="2100"
+               value="{{ current_year }}">
+      </div>
+
+      <div class="form-group">
+        <label for="type" class="required">Case Type</label>
+        <select id="type" name="type" required>
+          <option value="">Select type...</option>
+          <option value="burglary">Burglary</option>
+          <option value="robbery">Robbery</option>
+          <option value="fraud">Fraud</option>
+          <option value="homicide">Homicide</option>
+          <option value="assault">Assault</option>
+          <option value="arson">Arson</option>
+          <option value="theft">Theft</option>
+          <option value="vandalism">Vandalism</option>
+          <option value="unknown">Unknown / Other</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label for="status" class="required">Status</label>
+        <select id="status" name="status" required>
+          <option value="open">Open</option>
+          <option value="under investigation">Under Investigation</option>
+          <option value="pending trial">Pending Trial</option>
+          <option value="closed">Closed</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label for="priority" class="required">Priority</label>
+        <select id="priority" name="priority" required>
+          <option value="low">Low</option>
+          <option value="medium" selected>Medium</option>
+          <option value="high">High</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label for="confidence">Initial Confidence (0.0&ndash;1.0)</label>
+        <input type="range" id="confidence" name="confidence" min="0" max="1"
+               step="0.05" value="0.5">
+        <div style="display:flex;justify-content:space-between;color:var(--text-light);font-size:12px">
+          <span>0.0 (low)</span>
+          <span id="confidence-val">0.50</span>
+          <span>1.0 (high)</span>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label for="suspects_count">Number of Suspects</label>
+        <input type="number" id="suspects_count" name="suspects_count"
+               value="0" min="0" max="1000">
+      </div>
+
+      <div class="form-group">
+        <label for="evidence_count">Evidence Items</label>
+        <input type="number" id="evidence_count" name="evidence_count"
+               value="0" min="0" max="10000">
+      </div>
+
+      <div class="form-group">
+        <label for="assigned_to">Assigned To</label>
+        <input type="text" id="assigned_to" name="assigned_to" maxlength="100"
+               placeholder="Detective Smith">
+      </div>
+
+      <div class="form-group full">
+        <label for="tags">Tags</label>
+        <input type="text" id="tags" name="tags" maxlength="500"
+               placeholder="serial, commercial, organized">
+        <small style="color:var(--text-light)">Comma-separated</small>
+      </div>
+
+      <div class="form-group full">
+        <label>Attach File</label>
+        <div style="border:2px dashed #334155;border-radius:6px;padding:25px;
+                    text-align:center;cursor:pointer;transition:all .3s"
+             onclick="document.getElementById('case_file').click()"
+             onmouseover="this.style.borderColor='#60a5fa'"
+             onmouseout="this.style.borderColor='#334155'">
+          <input type="file" id="case_file" name="case_file"
+                 accept=".pdf,.doc,.docx,.txt,.jpg,.jpeg,.png"
+                 style="display:none">
+          <div style="font-size:36px;margin-bottom:8px">&#128206;</div>
+          <div style="font-weight:600">Click to upload</div>
+          <div style="color:var(--text-light);font-size:13px;margin-top:4px">
+            PDF, DOC, DOCX, TXT, JPG, PNG &mdash; max 10 MB
+          </div>
+          <div id="file-name" style="margin-top:10px;color:#60a5fa;font-weight:500"></div>
+        </div>
+      </div>
+
+      <div class="form-group full">
+        <label for="description" class="required">Description</label>
+        <textarea id="description" name="description" required maxlength="5000"
+                  placeholder="Detailed case description..."></textarea>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:12px;margin-top:25px;flex-wrap:wrap">
+      <button type="submit" class="btn">Create Case</button>
+      <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Cancel</a>
+    </div>
+  </form>
+</div>
+
+<script>
+const cs = document.getElementById('confidence');
+const cv = document.getElementById('confidence-val');
+cs.addEventListener('input', () => { cv.textContent = parseFloat(cs.value).toFixed(2); });
+
+document.getElementById('case_file').addEventListener('change', function(e) {
+  const f = e.target.files[0];
+  const el = document.getElementById('file-name');
+  if (f) {
+    el.textContent = `Selected: ${f.name} (${(f.size/1024/1024).toFixed(2)} MB)`;
+  } else {
+    el.textContent = '';
+  }
+});
+
+document.getElementById('case_name').addEventListener('blur', function() {
+  const idField = document.getElementById('case_id');
+  if (this.value && !idField.value) {
+    const rand = 'C' + Math.random().toString(36).substr(2, 4).toUpperCase();
+    idField.value = `${rand}-${new Date().getFullYear()}`;
+  }
+});
+</script>
+{% endblock %}
