@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}{{ case.case_name }} - SICCA{% endblock %}
+{% block content %}
+
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;
+              flex-wrap:wrap;gap:15px;margin-bottom:25px">
+    <div>
+      <h1>{{ case.case_name }}</h1>
+      <p style="color:var(--text-light);margin-top:5px">Case ID: {{ case.case_id }}</p>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <a href="{{ url_for('analyze_case', case_id=case.case_id) }}" class="btn btn-success">Analyze</a>
+      <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Back</a>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:25px">
+    <div>
+      <h3 style="color:#60a5fa;margin-bottom:15px">Case Information</h3>
+      <div style="display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #334155">
+        <span style="color:var(--text-light)">Type:</span>
+        <span>{{ case.type|title }}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #334155">
+        <span style="color:var(--text-light)">Status:</span>
+        <span>
+          {% if case.status == 'open' %}<span class="badge badge-high">{{ case.status|title }}</span>
+          {% elif case.status == 'under investigation' %}<span class="badge badge-medium">{{ case.status|title }}</span>
+          {% else %}<span class="badge badge-low">{{ case.status|title }}</span>{% endif %}
+        </span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #334155">
+        <span style="color:var(--text-light)">Priority:</span>
+        <span>
+          {% if case.priority == 'high' %}<span class="badge badge-high">High</span>
+          {% elif case.priority == 'medium' %}<span class="badge badge-medium">Medium</span>
+          {% else %}<span class="badge badge-low">Low</span>{% endif %}
+        </span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #334155">
+        <span style="color:var(--text-light)">Location:</span>
+        <span>{{ case.location }}</span>
+      </div>
+    </div>
+
+    <div>
+      <h3 style="color:#60a5fa;margin-bottom:15px">Investigation Details</h3>
+      <div style="display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #334155">
+        <span style="color:var(--text-light)">Year:</span>
+        <span>{{ case.year }}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #334155">
+        <span style="color:var(--text-light)">Suspects:</span>
+        <span>{{ case.suspects_count }}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #334155">
+        <span style="color:var(--text-light)">Evidence Items:</span>
+        <span>{{ case.evidence_count }}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #334155">
+        <span style="color:var(--text-light)">Assigned To:</span>
+        <span>{{ case.assigned_to or 'Unassigned' }}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #334155">
+        <span style="color:var(--text-light)">Confidence:</span>
+        <span>{{ "%.2f"|format(case.confidence) }}</span>
+      </div>
+    </div>
+  </div>
+
+  {% if case.description %}
+  <div style="margin-top:25px;background:rgba(15,23,42,.5);padding:20px;border-radius:8px">
+    <h3 style="color:#60a5fa;margin-bottom:12px">Description</h3>
+    <p style="line-height:1.8">{{ case.description }}</p>
+  </div>
+  {% endif %}
+
+  {% if case.tags %}
+  <div style="margin-top:20px">
+    <h3 style="color:#60a5fa;margin-bottom:10px">Tags</h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      {% for tag in case.tags.split(',') %}
+        {% if tag.strip() %}
+        <span style="background:rgba(96,165,250,.2);color:#60a5fa;padding:5px 12px;
+                     border-radius:20px;font-size:12px">{{ tag.strip() }}</span>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  {% if case.attached_file %}
+  <div style="margin-top:20px">
+    <h3 style="color:#60a5fa;margin-bottom:10px">Attachment</h3>
+    <p style="color:var(--text-light)">{{ case.attached_file }}</p>
+  </div>
+  {% endif %}
+
+  <div style="display:flex;justify-content:space-between;margin-top:30px;padding-top:20px;
+              border-top:1px solid #334155;color:var(--text-light);font-size:13px;
+              flex-wrap:wrap;gap:10px">
+    <div><strong>Created:</strong> {{ case.created[:19].replace('T', ' ') }}</div>
+    <div><strong>Last Modified:</strong> {{ case.modified[:19].replace('T', ' ') }}</div>
+  </div>
+</div>
+{% endblock %}
