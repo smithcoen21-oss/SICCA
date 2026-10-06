@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - SICCA{% endblock %}
+{% block content %}
+
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:15px;margin-bottom:20px">
+  <h1>Case Management Dashboard</h1>
+  <div style="color:var(--text-light);font-size:13px">Last refreshed: just now</div>
+</div>
+
+<div class="card" style="border-left:4px solid {% if model_available %}#10b981{% else %}#f59e0b{% endif %}">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+    <div>
+      <strong>AI Analysis System:</strong>
+      {% if model_available %}
+        <span style="color:#10b981">Bayesian + ML Hybrid Engine (model trained)</span>
+      {% else %}
+        <span style="color:#f59e0b">Bayesian-only (ML model not trained)</span>
+      {% endif %}
+    </div>
+    {% if current_user.is_admin() %}
+    <a href="{{ url_for('train_ml_model') }}" class="btn btn-sm btn-secondary">Train ML Model</a>
+    {% endif %}
+  </div>
+</div>
+
+<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:25px">
+  <a href="{{ url_for('create_case') }}" class="btn">+ Create New Case</a>
+  <a href="{{ url_for('bulk_upload') }}" class="btn btn-secondary">Bulk Upload</a>
+  <a href="{{ url_for('export_cases') }}" class="btn btn-success">Export Cases</a>
+  <a href="{{ url_for('network_view') }}" class="btn btn-warning">Network Analysis</a>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:20px;margin-bottom:30px">
+  <div class="card" style="border-left:4px solid #2563eb">
+    <div style="color:var(--text-light);font-size:12px;text-transform:uppercase;letter-spacing:.5px">Total Cases</div>
+    <div style="font-size:32px;font-weight:700;margin-top:8px">{{ stats.total_cases }}</div>
+  </div>
+  <div class="card" style="border-left:4px solid #10b981">
+    <div style="color:var(--text-light);font-size:12px;text-transform:uppercase;letter-spacing:.5px">Open Cases</div>
+    <div style="font-size:32px;font-weight:700;margin-top:8px">{{ stats.open_cases }}</div>
+  </div>
+  <div class="card" style="border-left:4px solid #ef4444">
+    <div style="color:var(--text-light);font-size:12px;text-transform:uppercase;letter-spacing:.5px">High Priority</div>
+    <div style="font-size:32px;font-weight:700;margin-top:8px">{{ stats.high_priority }}</div>
+  </div>
+</div>
+
+<div class="card" style="padding:0">
+  <div style="padding:20px;border-bottom:1px solid #334155;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+    <h2 style="margin:0;color:var(--text)">Recent Cases</h2>
+    <input type="text" id="caseSearch" placeholder="Search cases..."
+           style="max-width:300px" autocomplete="off">
+  </div>
+
+  {% if cases %}
+  <div style="overflow-x:auto">
+    <table id="caseTable">
+      <thead>
+        <tr>
+          <th>Case ID</th><th>Name</th><th>Type</th><th>Location</th>
+          <th>Status</th><th>Priority</th><th>Modified</th><th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in cases %}
+        <tr>
+          <td><strong>{{ c.case_id }}</strong></td>
+          <td>{{ c.case_name }}</td>
+          <td>{{ c.type|title }}</td>
+          <td>{{ c.location }}</td>
+          <td>
+            {% if c.status == 'open' %}<span class="badge badge-high">{{ c.status|title }}</span>
+            {% elif c.status == 'under investigation' %}<span class="badge badge-medium">Investigation</span>
+            {% else %}<span class="badge badge-low">{{ c.status|title }}</span>{% endif %}
+          </td>
+          <td>
+            {% if c.priority == 'high' %}<span class="badge badge-high">High</span>
+            {% elif c.priority == 'medium' %}<span class="badge badge-medium">Medium</span>
+            {% else %}<span class="badge badge-low">Low</span>{% endif %}
+          </td>
+          <td style="color:var(--text-light);font-size:13px">{{ c.modified[:19] }}</td>
+          <td>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+              <a href="{{ url_for('view_case', case_id=c.case_id) }}" class="btn btn-sm btn-secondary">View</a>
+              <a href="{{ url_for('analyze_case', case_id=c.case_id) }}" class="btn btn-sm btn-success">Analyze</a>
+              <form method="post" action="{{ url_for('delete_case', case_id=c.case_id) }}"
+                    onsubmit="return confirm('Delete case {{ c.case_id }}? This cannot be undone.');"
+                    style="display:inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div style="text-align:center;padding:60px 20px;color:var(--text-light)">
+    <div style="font-size:48px;margin-bottom:15px">&#128193;</div>
+    <h3>No cases found</h3>
+    <p style="margin-top:10px">Get started by creating your first case.</p>
+    <a href="{{ url_for('create_case') }}" class="btn" style="margin-top:20px">Create Your First Case</a>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+document.getElementById('caseSearch').addEventListener('input', function(e) {
+  const q = e.target.value.toLowerCase();
+  document.querySelectorAll('#caseTable tbody tr').forEach(row => {
+    row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+</script>
+{% endblock %}
