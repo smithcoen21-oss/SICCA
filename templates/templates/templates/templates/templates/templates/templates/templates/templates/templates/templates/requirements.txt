@@ -7,3 +7,5 @@ pandas>=2.2
 scikit-learn>=1.4
 joblib>=1.3
 pdfkit>=1.0
+(wkhtmltopdf is a system binary, not a pip package: apt-get install wkhtmltopdf or equivalent.)
+
