@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Bulk Upload - SICCA{% endblock %}
+{% block content %}
+
+<div class="card" style="max-width:900px;margin:0 auto">
+  <h1 style="margin-bottom:10px">Bulk Case Upload</h1>
+  <p style="color:var(--text-light);margin-bottom:25px">
+    Upload a CSV file with multiple case rows. Case IDs are generated
+    automatically with a unique suffix so repeat uploads never overwrite.
+  </p>
+
+  <form method="post" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+    <div style="border:2px dashed #60a5fa;border-radius:8px;padding:35px;
+                text-align:center;cursor:pointer"
+         onclick="document.getElementById('bulk_file').click()">
+      <input type="file" id="bulk_file" name="bulk_file"
+             accept=".csv" style="display:none">
+      <div style="font-size:40px">&#128193;</div>
+      <h3 style="margin-top:10px">Click to upload CSV</h3>
+      <p style="color:var(--text-light);margin-top:8px;font-size:13px">
+        Required columns: case_name, location, year, type, status
+      </p>
+      <div id="file-name" style="margin-top:12px;color:#60a5fa;font-weight:500"></div>
+    </div>
+
+    <div style="margin:25px 0">
+      <h4 style="margin-bottom:10px">Example format</h4>
+      <pre style="background:rgba(15,23,42,.8);padding:15px;border-radius:6px;
+                  overflow-x:auto;font-size:12px;color:#cbd5e1">case_name,location,year,type,status,confidence,suspects_count,evidence_count,description,priority,assigned_to,tags
+Bank Robbery Investigation,Downtown,2023,robbery,open,0.7,2,8,"Armed robbery at central bank",high,Detective Smith,"robbery,armed"
+Corporate Fraud,Financial District,2024,fraud,under investigation,0.8,3,12,"Complex financial fraud",high,Inspector Jones,"fraud,corporate"
+Residential Burglary,Suburbs,2023,burglary,closed,0.4,1,3,"Single suspect burglary",medium,Officer Brown,"burglary,residential"</pre>
+      <p style="color:var(--text-light);font-size:12px;margin-top:10px">
+        Blank numeric fields default to 0; blank confidence defaults to 0.5.
+        Malformed rows are skipped and reported.
+      </p>
+    </div>
+
+    <div style="display:flex;gap:12px;flex-wrap:wrap">
+      <button type="submit" class="btn btn-success">Upload Cases</button>
+      <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Cancel</a>
+    </div>
+  </form>
+</div>
+
+<script>
+document.getElementById('bulk_file').addEventListener('change', function(e) {
+  const f = e.target.files[0];
+  const el = document.getElementById('file-name');
+  el.textContent = f ? `Selected: ${f.name} (${(f.size/1024).toFixed(1)} KB)` : '';
+});
+</script>
+{% endblock %}
