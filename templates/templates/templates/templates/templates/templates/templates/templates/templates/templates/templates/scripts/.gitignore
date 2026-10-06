@@ -1,0 +1,26 @@
+# Runtime data — never commit
+sicca_data/
+*.db
+*.db-journal
+*.key
+secret.key
+*.log
+*.joblib
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Exports
+exports/
+SICCA_v2_report.pdf
+SICCA_v2_report.html
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
