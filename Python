@@ -1,45 +1,58 @@
+#!/usr/bin/env python3
 # =============================================================================
-# SICCA v2.0 - Secure Bayesian + Machine Learning Case Analysis
+# SICCA v2.1 - Bayesian + Machine Learning Case Analysis (decision support)
 # -----------------------------------------------------------------------------
-# Rewrite of the original single-file SICCA application.
-# Every issue listed in "Critical issues.txt" is addressed. Each is marked with
-# a "# FIX #n" comment at the point of change so the diff is auditable.
+# Run (development):
+#   pip install flask flask-login flask-wtf scikit-learn pandas numpy joblib
+#   export SICCA_ADMIN_PASS='a-strong-password-of-10+chars'   # first run only
+#   python sicca_app.py                     # same as: python sicca_app.py run
 #
-# Run:
-#   pip install -r requirements.txt
-#   export SICCA_ADMIN_USER=admin
-#   export SICCA_ADMIN_PASS='choose-a-strong-password'
-#   python sicca_app.py
+# Other commands:
+#   python sicca_app.py create-user alice --role analyst
+#   python sicca_app.py train training.csv
+#   python sicca_app.py check-templates     # shows where each template was found
 #
-# Templates live in ./templates (see reply 2 and 3 of the delivery).
+# Production: gunicorn "sicca_app:create_app()"  (behind HTTPS; if behind a
+# reverse proxy also wrap the app in werkzeug's ProxyFix so client IPs are right)
+#
+# Environment variables (all optional):
+#   SICCA_APP_ROOT, SICCA_BASE_DIR, SICCA_TEMPLATE_DIRS (os.pathsep-separated),
+#   SICCA_SECRET_KEY, SICCA_ADMIN_USER, SICCA_ADMIN_PASS, SICCA_HOST,
+#   SICCA_PORT, SICCA_DEBUG, SICCA_COOKIE_SECURE
+#
+# Training CSV columns: type,status,priority,year,suspects_count,
+#   evidence_count,label   (label is 0/1)
 # =============================================================================
 
 from __future__ import annotations
 
-import html as html_mod
-import json
+import argparse
+import getpass
+import hashlib
 import logging
 import os
 import re
 import secrets
-import shutil
 import sqlite3
 import sys
+import threading
 import time
 import uuid
-from datetime import datetime
+from collections import defaultdict, deque
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from functools import wraps
 from logging.handlers import RotatingFileHandler
-from math import exp
+from math import exp, isfinite
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
 from flask import (
-    Flask, abort, flash, g, jsonify, redirect, render_template,
-    request, send_file, session, url_for,
+    Flask, abort, flash, jsonify, redirect, render_template, request,
+    send_file, session, url_for,
 )
 from flask_login import (
     LoginManager, UserMixin, current_user, login_required, login_user,
@@ -47,6 +60,7 @@ from flask_login import (
 )
 from flask_wtf import CSRFProtect
 from flask_wtf.csrf import CSRFError
+from jinja2 import ChoiceLoader, DictLoader, FileSystemLoader
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, roc_auc_score
@@ -56,69 +70,82 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-try:
-    import pdfkit  # FIX #6: optional; absence is reported, not hidden.
-except Exception:  # pragma: no cover
-    pdfkit = None
-
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-class Config:
-    """Runtime configuration. Everything tunable via environment."""
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
-    BASE_DIR = Path(os.environ.get("SICCA_BASE_DIR", "sicca_data")).resolve()
-    CASES_DB = BASE_DIR / "sicca.db"            # FIX #21: SQLite, not per-case JSON.
+
+class Config:
+    APP_ROOT = Path(os.environ.get("SICCA_APP_ROOT",
+                                   Path(__file__).resolve().parent)).resolve()
+    BASE_DIR = Path(os.environ.get("SICCA_BASE_DIR",
+                                   APP_ROOT / "sicca_data")).resolve()
+    CASES_DB = BASE_DIR / "sicca.db"
     LOGS_DIR = BASE_DIR / "logs"
-    EXPORTS_DIR = BASE_DIR / "exports"
     UPLOADS_DIR = BASE_DIR / "uploads"
     MODELS_DIR = BASE_DIR / "models"
-    TRAINING_DIR = BASE_DIR / "training_data"
 
-    MAX_CONTENT_LENGTH = 10 * 1024 * 1024       # FIX #5: upload size cap.
+    MAX_CONTENT_LENGTH = 10 * 1024 * 1024
     ALLOWED_UPLOAD_EXTENSIONS = {
         ".pdf", ".doc", ".docx", ".txt", ".jpg", ".jpeg", ".png",
     }
     MODEL_PATH = MODELS_DIR / "sicca_pipeline.joblib"
-    MODEL_VERSION = "2.0.0"                     # FIX #9: single source of truth.
+    MODEL_HASH_PATH = MODELS_DIR / "sicca_pipeline.joblib.sha256"
+    MODEL_VERSION = "2.1.0"
+    MIN_TRAIN_ROWS = 50
+    MIN_PER_CLASS = 5
 
-    # FIX #4: debug off by default; bind to loopback unless overridden.
-    DEBUG = os.environ.get("SICCA_DEBUG", "0") == "1"
     HOST = os.environ.get("SICCA_HOST", "127.0.0.1")
     PORT = int(os.environ.get("SICCA_PORT", "5000"))
+    DEBUG = os.environ.get("SICCA_DEBUG", "0") == "1"
 
     SESSION_LIFETIME_SECONDS = 3600
-    CSRF_ENABLED = True
+    COOKIE_SECURE = (os.environ.get(
+        "SICCA_COOKIE_SECURE",
+        "0" if HOST in LOOPBACK_HOSTS else "1") == "1")
+    PAGE_SIZE = 50
+
+    # Template discovery (see discover_template_dirs)
+    TEMPLATE_SCAN_DEPTH = 4
+    TEMPLATE_SKIP_DIRS = {
+        ".git", "__pycache__", "node_modules", "venv", ".venv", "env",
+        "static", "site-packages", "dist", "build",
+    }
 
     @classmethod
     def ensure_dirs(cls) -> None:
-        for d in (cls.BASE_DIR, cls.LOGS_DIR, cls.EXPORTS_DIR,
-                  cls.UPLOADS_DIR, cls.MODELS_DIR, cls.TRAINING_DIR):
+        for d in (cls.BASE_DIR, cls.LOGS_DIR, cls.UPLOADS_DIR, cls.MODELS_DIR):
             d.mkdir(parents=True, exist_ok=True)
 
 
-# FIX #18: secret key survives restarts and works across workers.
 def load_or_create_secret_key() -> str:
     env = os.environ.get("SICCA_SECRET_KEY")
     if env:
         return env
-    keyfile = Config.BASE_DIR / "secret.key"
     Config.BASE_DIR.mkdir(parents=True, exist_ok=True)
-    if keyfile.exists():
-        return keyfile.read_text().strip()
+    keyfile = Config.BASE_DIR / "secret.key"
+    try:  # create atomically with owner-only permissions
+        fd = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        key = keyfile.read_text().strip()
+        if not key:
+            raise RuntimeError(f"{keyfile} is empty; delete it and restart.")
+        return key
     key = secrets.token_hex(32)
-    keyfile.write_text(key)
-    try:
-        os.chmod(keyfile, 0o600)
-    except OSError:
-        pass
+    with os.fdopen(fd, "w") as fh:
+        fh.write(key)
     return key
 
 
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 # =============================================================================
-# LOGGING  (FIX #19: unused imports removed; single configured logger.)
+# LOGGING
 # =============================================================================
 
 def configure_logging() -> logging.Logger:
@@ -142,7 +169,7 @@ LOG = configure_logging()
 
 
 # =============================================================================
-# DATABASE  (FIX #21: SQLite replaces one-JSON-file-per-case.)
+# DATABASE
 # =============================================================================
 
 SCHEMA = """
@@ -169,6 +196,7 @@ CREATE TABLE IF NOT EXISTS cases (
     tags            TEXT NOT NULL DEFAULT '',
     attached_file   TEXT,
     file_path       TEXT,
+    created_by      TEXT NOT NULL DEFAULT '',
     created         TEXT NOT NULL,
     modified        TEXT NOT NULL
 );
@@ -187,45 +215,90 @@ CREATE TABLE IF NOT EXISTS audit_log (
 """
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(Config.CASES_DB, detect_types=sqlite3.PARSE_DECLTYPES)
+@contextmanager
+def db():
+    """Connection that always commits-or-rolls-back and is always closed."""
+    conn = sqlite3.connect(Config.CASES_DB, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{3,50}$")
+MIN_PASSWORD_LEN = 10
+
+
+def create_user(username: str, password: str, role: str = "analyst") -> None:
+    if not USERNAME_RE.match(username):
+        raise ValueError("Username must be 3-50 chars: letters, digits, . _ -")
+    if len(password) < MIN_PASSWORD_LEN:
+        raise ValueError(f"Password must be at least {MIN_PASSWORD_LEN} characters.")
+    if role not in ("admin", "analyst"):
+        raise ValueError("Role must be 'admin' or 'analyst'.")
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO users (username, password, role) VALUES (?,?,?)",
+            (username, generate_password_hash(password), role),
+        )
 
 
 def init_db() -> None:
     Config.ensure_dirs()
     with db() as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
-        row = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
-        if row["n"] == 0:
-            username = os.environ.get("SICCA_ADMIN_USER", "admin")
-            password = os.environ.get("SICCA_ADMIN_PASS") or secrets.token_urlsafe(12)
-            conn.execute(
-                "INSERT INTO users (username, password, role) VALUES (?,?,?)",
-                (username, generate_password_hash(password), "admin"),
-            )
-            LOG.warning(
-                "Seeded admin user '%s' with password: %s  (change immediately)",
-                username, password,
-            )
-        conn.commit()
+        # Migration for databases created by v2.0 (no created_by column).
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(cases)")}
+        if "created_by" not in cols:
+            conn.execute("ALTER TABLE cases ADD COLUMN "
+                         "created_by TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_creator "
+                     "ON cases(created_by)")
+        n_users = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+
+    if n_users:
+        return
+    username = os.environ.get("SICCA_ADMIN_USER", "admin")
+    supplied = os.environ.get("SICCA_ADMIN_PASS")
+    password = supplied or secrets.token_urlsafe(14)
+    try:
+        create_user(username, password, "admin")
+    except sqlite3.IntegrityError:
+        return  # another worker seeded it first
+    if supplied:
+        LOG.info("Seeded admin user '%s' from SICCA_ADMIN_PASS.", username)
+    else:
+        # Printed to the terminal only. It is deliberately NOT sent to the log
+        # file, so it cannot end up in backups or log shippers.
+        LOG.warning("Seeded admin user '%s' with a generated password "
+                    "(shown once on stderr).", username)
+        print(f"\n*** SICCA initial admin login ***\n  user: {username}\n"
+              f"  pass: {password}\nStore it now; it is not saved anywhere.\n",
+              file=sys.stderr)
 
 
-def audit(actor: str, action: str, target: str, details: str = "") -> None:
-    # FIX #11: audit trail for every state-changing operation.
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO audit_log (ts, actor, action, target, details) "
-            "VALUES (?,?,?,?,?)",
-            (datetime.utcnow().isoformat(), actor, action, target, details),
-        )
-        conn.commit()
+def audit(actor: str, action: str, target: str, details: str = "",
+          conn: Optional[sqlite3.Connection] = None) -> None:
+    """Pass `conn` to make the audit row part of the caller's transaction."""
+    sql = ("INSERT INTO audit_log (ts, actor, action, target, details) "
+           "VALUES (?,?,?,?,?)")
+    params = (now_iso(), actor, action, target, details)
+    if conn is not None:
+        conn.execute(sql, params)
+    else:
+        with db() as c:
+            c.execute(sql, params)
 
 
 # =============================================================================
-# AUTH  (FIX #3: login, roles, CSRF on every mutating route.)
+# AUTH
 # =============================================================================
 
 class User(UserMixin):
@@ -252,19 +325,69 @@ def load_user(uid: str) -> Optional[User]:
 
 def admin_required(f):
     @wraps(f)
-    @login_required
     def wrapper(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return login_manager.unauthorized()
         if not current_user.is_admin():
             abort(403)
         return f(*args, **kwargs)
     return wrapper
 
 
+class LoginThrottle:
+    """
+    In-memory failure counter (per process). Good enough for a single worker;
+    with several workers use Flask-Limiter with a shared store instead.
+    """
+
+    def __init__(self, window: int = 900):
+        self.window = window
+        self._fails: Dict[str, Deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def wait_seconds(self, key: str, limit: int) -> int:
+        now = time.time()
+        with self._lock:
+            q = self._fails.get(key)
+            if not q:
+                return 0
+            while q and now - q[0] > self.window:
+                q.popleft()
+            if not q:
+                del self._fails[key]
+                return 0
+            if len(q) >= limit:
+                return max(1, int(self.window - (now - q[0])))
+            return 0
+
+    def fail(self, key: str) -> None:
+        with self._lock:
+            self._fails[key].append(time.time())
+
+    def clear(self, key: str) -> None:
+        with self._lock:
+            self._fails.pop(key, None)
+
+
+THROTTLE = LoginThrottle()
+# Used so that "unknown user" takes as long as "wrong password".
+_DUMMY_HASH = generate_password_hash(secrets.token_hex(16))
+
+
 # =============================================================================
-# VALIDATION  (FIX #12: no manual escaping; Jinja autoescape is trusted.)
+# VALIDATION
 # =============================================================================
 
 CASE_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,50}$")
+
+CASE_TYPES = ("fraud", "homicide", "robbery", "arson", "burglary",
+              "assault", "theft", "vandalism", "unknown")
+STATUSES = ("open", "under investigation", "pending trial", "closed")
+PRIORITIES = ("low", "medium", "high")
+
+
+class FormError(ValueError):
+    """Raised for user-correctable input problems."""
 
 
 def validate_case_id(case_id: str) -> Tuple[bool, str]:
@@ -273,8 +396,55 @@ def validate_case_id(case_id: str) -> Tuple[bool, str]:
     return True, ""
 
 
+def clean_text(value: Any, max_len: int = 1000) -> str:
+    """Store raw text (Jinja escapes on render). Drops NULs/control chars."""
+    if value is None:
+        return ""
+    text = str(value).replace("\x00", "")
+    text = "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
+    return text.strip()[:max_len]
+
+
+def parse_int(raw: Any, label: str, lo: int, hi: int,
+              default: Optional[int] = None) -> int:
+    if raw is None or str(raw).strip() == "":
+        if default is not None:
+            return default
+        raise FormError(f"{label} is required.")
+    try:
+        n = int(str(raw).strip())
+    except ValueError:
+        raise FormError(f"{label} must be a whole number.")
+    if not lo <= n <= hi:
+        raise FormError(f"{label} must be between {lo} and {hi}.")
+    return n
+
+
+def parse_float(raw: Any, label: str, lo: float, hi: float,
+                default: Optional[float] = None) -> float:
+    if raw is None or str(raw).strip() == "":
+        if default is not None:
+            return default
+        raise FormError(f"{label} is required.")
+    try:
+        x = float(str(raw).strip())
+    except ValueError:
+        raise FormError(f"{label} must be a number.")
+    if not isfinite(x) or not lo <= x <= hi:
+        raise FormError(f"{label} must be between {lo} and {hi}.")
+    return x
+
+
+def parse_choice(raw: Any, label: str, choices: Tuple[str, ...],
+                 default: str) -> str:
+    value = clean_text(raw, 40).lower() or default
+    if value not in choices:
+        raise FormError(f"{label} must be one of: {', '.join(choices)}.")
+    return value
+
+
+# Lenient helpers for values already in the database (never raise).
 def coerce_int(value: Any, default: int, lo: int, hi: int) -> int:
-    # FIX #16: range validation for every numeric field.
     try:
         n = int(float(value))
     except (TypeError, ValueError):
@@ -287,45 +457,107 @@ def coerce_float(value: Any, default: float, lo: float, hi: float) -> float:
         x = float(value)
     except (TypeError, ValueError):
         return default
+    if not isfinite(x):
+        return default
     return max(lo, min(hi, x))
 
 
-def clean_text(value: Any, max_len: int = 1000) -> str:
-    """Store raw text. Jinja escapes on render; no double-escaping."""
-    if value is None:
-        return ""
-    return str(value).strip()[:max_len]
+def build_case_record(form: Mapping[str, Any], case_id: str,
+                      username: str) -> Dict[str, Any]:
+    name = clean_text(form.get("case_name"), 200)
+    if not name:
+        raise FormError("Case name is required.")
+    now = now_iso()
+    return {
+        "case_id": case_id,
+        "case_name": name,
+        "location": clean_text(form.get("location"), 200),
+        "year": parse_int(form.get("year"), "Year", 1900, 2100,
+                          default=datetime.now().year),
+        "type": parse_choice(form.get("type"), "Type", CASE_TYPES, "unknown"),
+        "status": parse_choice(form.get("status"), "Status", STATUSES, "open"),
+        "confidence": parse_float(form.get("confidence"), "Confidence",
+                                  0.0, 1.0, default=0.5),
+        "suspects_count": parse_int(form.get("suspects_count"),
+                                    "Suspects", 0, 1000, default=0),
+        "evidence_count": parse_int(form.get("evidence_count"),
+                                    "Evidence items", 0, 10000, default=0),
+        "description": clean_text(form.get("description"), 5000),
+        "priority": parse_choice(form.get("priority"), "Priority",
+                                 PRIORITIES, "medium"),
+        "assigned_to": clean_text(form.get("assigned_to"), 100),
+        "tags": clean_text(form.get("tags"), 500),
+        "attached_file": None,
+        "file_path": None,
+        "created_by": username,
+        "created": now,
+        "modified": now,
+    }
 
 
-def safe_upload_name(case_id: str, filename: str) -> str:
-    # FIX #5: secure_filename on both parts; UUID to avoid collisions.
-    base = secure_filename(filename) or "upload"
-    return f"{secure_filename(case_id)}__{uuid.uuid4().hex[:8]}__{base}"
+def sniff_matches(ext: str, head: bytes) -> bool:
+    """Cheap magic-byte check so a renamed file is not accepted."""
+    if ext == ".pdf":
+        return head.startswith(b"%PDF-")
+    if ext in (".jpg", ".jpeg"):
+        return head.startswith(b"\xff\xd8\xff")
+    if ext == ".png":
+        return head.startswith(b"\x89PNG\r\n\x1a\n")
+    if ext == ".docx":
+        return head.startswith(b"PK\x03\x04")
+    if ext == ".doc":
+        return head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+    if ext == ".txt":
+        return b"\x00" not in head
+    return False
+
+
+def prepare_upload(file, case_id: str) -> Optional[Tuple[Any, str, str]]:
+    """Validate (but do not save) an upload. Returns (file, stored, display)."""
+    if not file or not file.filename:
+        return None
+    ext = Path(file.filename).suffix.lower()
+    if ext not in Config.ALLOWED_UPLOAD_EXTENSIONS:
+        raise FormError(f"File type '{ext or 'unknown'}' is not allowed.")
+    head = file.stream.read(16)
+    file.stream.seek(0)
+    if not sniff_matches(ext, head):
+        raise FormError("File contents do not match its extension.")
+    display = secure_filename(file.filename) or f"upload{ext}"
+    stored = (f"{secure_filename(case_id)}__{uuid.uuid4().hex[:8]}__{display}")
+    return file, stored, display
 
 
 # =============================================================================
-# BAYESIAN MODEL  (FIX #7 + #8: evidence updates the posterior; decay matters.)
+# BAYESIAN MODEL  (heuristic and UNCALIBRATED - decision support only)
 # =============================================================================
 
 class BayesianConfig:
     """
-    Priors are per-crime base odds (independent, NOT normalised to 1).
-    Likelihood ratio = BASE_LR[type] * f(evidence, suspects, status, priority).
-    """
+    All numbers below are hand-chosen assumptions, not fitted to data.
 
-    PRIORS = {
-        "fraud": 0.12, "homicide": 0.35, "robbery": 0.20, "arson": 0.25,
-        "burglary": 0.18, "assault": 0.22, "theft": 0.15,
-        "vandalism": 0.10, "unknown": 0.10,
-    }
-    BASE_LR = {
+    posterior odds = prior odds * type_LR * evidence_LR
+
+    v2.0 used a different prior per crime type, which made "high" unreachable
+    for most types (fraud topped out near 0.39). Here every case starts from
+    the same prior and the crime type only contributes a likelihood ratio.
+    """
+    BASE_PRIOR = 0.30
+    TYPE_LR = {
         "fraud": 1.2, "homicide": 2.0, "robbery": 1.6, "arson": 1.8,
         "burglary": 1.4, "assault": 1.7, "theft": 1.3,
         "vandalism": 1.1, "unknown": 1.0,
     }
     AGE_DECAY_LAMBDA = 0.05
-    MAX_FEATURE_LR = 4.0
+    MAX_FEATURE_LR = 6.0
     MIN_FEATURE_LR = 0.25
+    HIGH = 0.70
+    MEDIUM = 0.40
+
+
+def risk_level(score: float) -> str:
+    return ("high" if score > BayesianConfig.HIGH
+            else "medium" if score > BayesianConfig.MEDIUM else "low")
 
 
 def _odds(p: float) -> float:
@@ -339,11 +571,7 @@ def _prob(o: float) -> float:
 
 def _evidence_lr(evidence_count: int, suspects_count: int,
                  status: str, priority: str) -> float:
-    """
-    Evidence-driven likelihood ratio. Replaces the original hardcoded
-    per-type lookup so that evidence actually affects the score.
-    """
-    ev = 1.0 + 0.35 * np.log1p(max(0, evidence_count))
+    ev = 1.0 + 0.35 * float(np.log1p(max(0, evidence_count)))
     su = 1.0 + 0.10 * max(0, suspects_count - 1)
     st = {"open": 1.05, "under investigation": 1.15,
           "pending trial": 1.25, "closed": 0.90}.get(status.lower(), 1.0)
@@ -353,90 +581,135 @@ def _evidence_lr(evidence_count: int, suspects_count: int,
                min(BayesianConfig.MAX_FEATURE_LR, lr))
 
 
-def bayesian_score(case: Dict[str, Any], current_year: int) -> Dict[str, Any]:
+def bayesian_score(case: Mapping[str, Any], current_year: int) -> Dict[str, Any]:
     ctype = str(case.get("type", "unknown")).lower()
-    prior = BayesianConfig.PRIORS.get(ctype, 0.10)
-    base_lr = BayesianConfig.BASE_LR.get(ctype, 1.0)
-
+    type_lr = BayesianConfig.TYPE_LR.get(ctype, 1.0)
     ev_lr = _evidence_lr(
         coerce_int(case.get("evidence_count", 0), 0, 0, 10000),
         coerce_int(case.get("suspects_count", 0), 0, 0, 1000),
-        str(case.get("status", "unknown")),
+        str(case.get("status", "open")),
         str(case.get("priority", "medium")),
     )
-    total_lr = base_lr * ev_lr
-    posterior = _prob(_odds(prior) * total_lr)
+    posterior = _prob(_odds(BayesianConfig.BASE_PRIOR) * type_lr * ev_lr)
 
     base_conf = coerce_float(case.get("confidence", 0.5), 0.5, 0.0, 1.0)
     year = coerce_int(case.get("year", current_year), current_year, 1900, 2100)
     age = max(0, current_year - year)
-    decayed_conf = max(0.0, min(1.0,
-        base_conf * exp(-BayesianConfig.AGE_DECAY_LAMBDA * age)))
+    decayed_conf = max(0.0, min(1.0, base_conf * exp(
+        -BayesianConfig.AGE_DECAY_LAMBDA * age)))
 
-    # FIX #8: decay now multiplies the posterior; it is not just a label.
     adjusted = posterior * (0.5 + 0.5 * decayed_conf)
-
     return {
         "posterior": float(posterior),
         "adjusted_posterior": float(adjusted),
         "confidence": float(decayed_conf),
-        "prior_used": float(prior),
-        "base_likelihood_ratio": float(base_lr),
+        "prior_used": BayesianConfig.BASE_PRIOR,
+        "type_likelihood_ratio": float(type_lr),
         "evidence_likelihood_ratio": float(ev_lr),
-        "risk_level": ("high" if adjusted > 0.70
-                       else "medium" if adjusted > 0.40 else "low"),
+        "risk_level": risk_level(adjusted),
+        "calibrated": False,
     }
 
 
+def max_reachable_score(ctype: str) -> float:
+    """Highest adjusted posterior possible for a type (conf=1, age=0)."""
+    lr = (BayesianConfig.TYPE_LR.get(ctype, 1.0)
+          * BayesianConfig.MAX_FEATURE_LR)
+    return _prob(_odds(BayesianConfig.BASE_PRIOR) * lr)
+
+
+def check_risk_reachability() -> None:
+    for ctype in CASE_TYPES:
+        top = max_reachable_score(ctype)
+        if top <= BayesianConfig.HIGH:
+            LOG.warning("Risk config: '%s' can never exceed %.2f, so it can "
+                        "never be rated 'high'.", ctype, top)
+
+
 # =============================================================================
-# MACHINE LEARNING  (FIX #1: proper Pipeline, single artifact, honest errors.)
+# MACHINE LEARNING
 # =============================================================================
 
 CATEGORICAL = ["type", "status", "priority"]
-# FIX #11: "location" removed from features -- it is a proxy for
-# demographics/ethnicity and is not acceptable as a model input.
-NUMERIC = ["year", "suspects_count", "evidence_count",
-           "posterior", "confidence"]
+# "location" is deliberately excluded (proxy for demographics).
+# The Bayesian posterior is deliberately excluded too: feeding it in made the
+# ML score depend on the Bayesian score, so blending them double-counted it.
+NUMERIC = ["year", "suspects_count", "evidence_count"]
 TARGET = "label"
+FEATURE_SPEC = {"categorical": CATEGORICAL, "numeric": NUMERIC}
+
+
+def _make_ohe() -> OneHotEncoder:
+    try:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:  # scikit-learn < 1.2
+        return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
 
 def build_pipeline() -> Pipeline:
     pre = ColumnTransformer(
-        transformers=[
-            ("cat", OneHotEncoder(handle_unknown="ignore",
-                                  sparse_output=False), CATEGORICAL),
-            ("num", StandardScaler(), NUMERIC),
-        ],
+        transformers=[("cat", _make_ohe(), CATEGORICAL),
+                      ("num", StandardScaler(), NUMERIC)],
         remainder="drop",
     )
-    return Pipeline([
-        ("pre", pre),
-        ("clf", LogisticRegression(max_iter=2000, random_state=42)),
-    ])
+    return Pipeline([("pre", pre),
+                     ("clf", LogisticRegression(max_iter=2000,
+                                                random_state=42))])
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _nan_to_none(x: float) -> Optional[float]:
+    return None if (x is None or not isfinite(x)) else float(x)
 
 
 class MLModel:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, hash_path: Path):
         self.path = path
+        self.hash_path = hash_path
         self._pipe: Optional[Pipeline] = None
         self._meta: Dict[str, Any] = {}
+        self._mtime: float = 0.0
+        self._lock = threading.Lock()
 
     def exists(self) -> bool:
         return self.path.exists()
 
     def load(self) -> Pipeline:
-        if self._pipe is None:
+        """Loads (and reloads if another worker retrained) after an
+        integrity check. joblib files are pickles: only load files that this
+        app wrote."""
+        with self._lock:
             if not self.exists():
                 raise FileNotFoundError("Model not trained yet.")
+            mtime = self.path.stat().st_mtime
+            if self._pipe is not None and mtime == self._mtime:
+                return self._pipe
+            expected = (self.hash_path.read_text().strip()
+                        if self.hash_path.exists() else "")
+            if expected != _sha256(self.path):
+                raise RuntimeError(
+                    "Model file failed its integrity check; retrain it.")
             artifact = joblib.load(self.path)
-            self._pipe = artifact["pipeline"]
-            self._meta = artifact.get("meta", {})
-        return self._pipe
+            meta = artifact.get("meta", {})
+            if meta.get("features") != FEATURE_SPEC:
+                raise RuntimeError(
+                    "Model was trained with a different feature set; retrain.")
+            self._pipe, self._meta, self._mtime = artifact["pipeline"], meta, mtime
+            return self._pipe
 
     @property
     def meta(self) -> Dict[str, Any]:
-        if not self._meta and self.exists():
-            _ = self.load()
+        try:
+            self.load()
+        except Exception:
+            return {}
         return self._meta
 
     def train(self, df: pd.DataFrame) -> Dict[str, Any]:
@@ -445,156 +718,179 @@ class MLModel:
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
 
-        df = df.dropna(subset=[TARGET]).copy()
+        df = df[CATEGORICAL + NUMERIC + [TARGET]].copy()
+        for c in CATEGORICAL:
+            df[c] = df[c].astype(str).str.strip().str.lower()
+        for c in NUMERIC + [TARGET]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna()
+        df = df[df[TARGET].isin([0, 1])]
         df[TARGET] = df[TARGET].astype(int)
 
-        if df[TARGET].nunique() < 2:
+        if len(df) < Config.MIN_TRAIN_ROWS:
             raise ValueError(
-                "Training data must contain both classes (0 and 1).")
-        # FIX #9: refuse undersized training sets rather than reporting
-        # meaningless metrics (the original trained on 10 rows / 3 test).
-        if len(df) < 20:
+                f"Only {len(df)} usable rows; at least "
+                f"{Config.MIN_TRAIN_ROWS} are required for meaningful metrics.")
+        counts = df[TARGET].value_counts()
+        if len(counts) < 2 or counts.min() < Config.MIN_PER_CLASS:
             raise ValueError(
-                f"Refusing to train on {len(df)} rows; "
-                "at least 20 are required for a meaningful split.")
+                f"Each class (0 and 1) needs at least {Config.MIN_PER_CLASS} "
+                f"rows; got {counts.to_dict()}.")
 
         y = df[TARGET]
-        X = df.drop(columns=[TARGET])
-        counts = y.value_counts()
-        strat = y if counts.min() >= 2 else None
-
+        X = df[CATEGORICAL + NUMERIC]
         X_tr, X_te, y_tr, y_te = train_test_split(
-            X, y, test_size=0.25, random_state=42, stratify=strat,
-        )
+            X, y, test_size=0.25, random_state=42, stratify=y)
 
         pipe = build_pipeline()
         pipe.fit(X_tr, y_tr)
-
         prob = pipe.predict_proba(X_te)[:, 1]
         pred = (prob >= 0.5).astype(int)
-        report = classification_report(y_te, pred, output_dict=True,
-                                       zero_division=0)
 
+        trained_at = now_iso()
         metrics = {
-            "roc_auc": (float(roc_auc_score(y_te, prob))
-                        if y_te.nunique() > 1 else float("nan")),
+            "roc_auc": (_nan_to_none(float(roc_auc_score(y_te, prob)))
+                        if y_te.nunique() > 1 else None),
             "accuracy": float((pred == y_te).mean()),
-            "report": report,
+            "report": classification_report(y_te, pred, output_dict=True,
+                                            zero_division=0),
             "training_samples": int(len(X_tr)),
             "test_samples": int(len(X_te)),
             "model_version": Config.MODEL_VERSION,
-            "trained_at": datetime.utcnow().isoformat(),
+            "trained_at": trained_at,
         }
-        artifact = {
-            "pipeline": pipe,
-            "meta": {
-                "version": Config.MODEL_VERSION,
-                "trained_at": metrics["trained_at"],
-                "features": {"categorical": CATEGORICAL, "numeric": NUMERIC},
-                "metrics": metrics,
-            },
-        }
+        artifact = {"pipeline": pipe,
+                    "meta": {"version": Config.MODEL_VERSION,
+                             "trained_at": trained_at,
+                             "features": FEATURE_SPEC,
+                             "metrics": metrics}}
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(artifact, self.path)
-        self._pipe, self._meta = pipe, artifact["meta"]
+        tmp = self.path.with_suffix(".tmp")
+        joblib.dump(artifact, tmp)
+        digest = _sha256(tmp)
+        os.replace(tmp, self.path)
+        self.hash_path.write_text(digest)
+        with self._lock:
+            self._pipe, self._meta = pipe, artifact["meta"]
+            self._mtime = self.path.stat().st_mtime
         return metrics
 
-    def predict_one(self, case: Dict[str, Any],
-                    bayes: Dict[str, Any]) -> Tuple[Optional[float], str]:
-        """
-        FIX #1: returns (probability, error_message). On any failure the
-        caller surfaces the reason in the UI instead of silently using 0.5.
-        Because the pipeline embeds OneHotEncoder(handle_unknown='ignore'),
-        single-row prediction cannot fail from a column-count mismatch.
-        """
+    def predict_one(self, case: Mapping[str, Any]
+                    ) -> Tuple[Optional[float], str]:
         if not self.exists():
             return None, "ML model is not trained."
         try:
             pipe = self.load()
-            X = pd.DataFrame([self._case_to_row(case, bayes)])[CATEGORICAL + NUMERIC]
+            X = pd.DataFrame([self._case_to_row(case)])[CATEGORICAL + NUMERIC]
             return float(pipe.predict_proba(X)[0, 1]), ""
         except Exception as exc:
             LOG.exception("ML prediction failed")
-            return None, f"ML prediction failed: {exc}"
+            return None, f"ML unavailable: {exc}"
 
     @staticmethod
-    def _case_to_row(case: Dict[str, Any],
-                     bayes: Dict[str, Any]) -> Dict[str, Any]:
+    def _case_to_row(case: Mapping[str, Any]) -> Dict[str, Any]:
+        yr = datetime.now().year
         return {
             "type": str(case.get("type", "unknown")).lower(),
-            "status": str(case.get("status", "unknown")).lower(),
+            "status": str(case.get("status", "open")).lower(),
             "priority": str(case.get("priority", "medium")).lower(),
-            "year": coerce_int(case.get("year", datetime.now().year),
-                               datetime.now().year, 1900, 2100),
+            "year": coerce_int(case.get("year", yr), yr, 1900, 2100),
             "suspects_count": coerce_int(case.get("suspects_count", 0),
                                          0, 0, 1000),
             "evidence_count": coerce_int(case.get("evidence_count", 0),
                                          0, 0, 10000),
-            "posterior": float(bayes["posterior"]),
-            "confidence": float(bayes["confidence"]),
         }
 
 
 # =============================================================================
-# HYBRID ANALYTICS  (FIX #2: high risk reachable; weights renormalise.)
+# CROSS-BORDER HEURISTICS (rule-based; labelled honestly)
+# =============================================================================
+
+CRIME_CATEGORY = {
+    "homicide": "violent_crime", "assault": "violent_crime",
+    "robbery": "violent_crime", "fraud": "financial_crime",
+    "theft": "property_crime", "burglary": "property_crime",
+    "arson": "property_crime", "vandalism": "property_crime",
+}
+
+
+class CrossBorderHeuristics:
+    @staticmethod
+    def risk(case: Mapping[str, Any]) -> Dict[str, Any]:
+        category = CRIME_CATEGORY.get(str(case.get("type", "")).lower(),
+                                      "other_crime")
+        crime_risk = {
+            "violent_crime": 0.8, "sexual_violence": 0.9, "terrorism": 1.0,
+            "organized_crime": 0.7, "financial_crime": 0.4,
+            "property_crime": 0.3,
+        }.get(category, 0.5)
+        ev = coerce_int(case.get("evidence_count", 0), 0, 0, 10000)
+        su = coerce_int(case.get("suspects_count", 0), 0, 0, 1000)
+        score = (0.6 * crime_risk + 0.2 * min(1.0, ev / 10.0)
+                 + 0.2 * min(1.0, su / 5.0))
+        return {
+            "risk_score": round(score, 3),
+            "risk_level": risk_level(score),
+            "crime_category": category,
+            "method": "transparent_heuristic",
+            "factors": ["crime_category", "evidence_count", "suspects_count"],
+        }
+
+
+# =============================================================================
+# HYBRID ENGINE
 # =============================================================================
 
 class HybridEngine:
+    W_BAYES = 0.6
+    W_ML = 0.4
+
     def __init__(self, ml: MLModel):
         self.ml = ml
 
-    def analyze(self, case: Dict[str, Any]) -> Dict[str, Any]:
-        t0 = time.perf_counter()
-        current_year = datetime.now().year
+    @staticmethod
+    def _ml_certainty(p: float) -> str:
+        d = abs(p - 0.5) * 2  # 0 = coin flip, 1 = fully certain either way
+        return "high" if d > 0.6 else "medium" if d > 0.3 else "low"
 
-        bayes = bayesian_score(case, current_year)
-        ml_prob, ml_err = self.ml.predict_one(case, bayes)
+    def analyze(self, case: Mapping[str, Any]) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        bayes = bayesian_score(case, datetime.now().year)
+        ml_prob, ml_err = self.ml.predict_one(case)
+        version = self.ml.meta.get("version", Config.MODEL_VERSION)
 
         if ml_prob is None:
-            # FIX #2: when ML is unavailable, do not blend in a constant
-            # 0.5 (which capped the score at ~0.54 and made "high" unreachable).
             final = bayes["adjusted_posterior"]
             weights = {"bayesian": 1.0, "ml": 0.0}
-            ml_block = {
-                "probability": None,
-                "confidence": "unavailable",
-                "model_available": False,
-                "error": ml_err,
-                "model_version": self.ml.meta.get(
-                    "version", Config.MODEL_VERSION),
-            }
+            ml_block = {"probability": None, "confidence": "unavailable",
+                        "model_available": False, "error": ml_err,
+                        "model_version": version}
         else:
-            weights = {"bayesian": 0.6, "ml": 0.4}
+            weights = {"bayesian": self.W_BAYES, "ml": self.W_ML}
             final = (weights["bayesian"] * bayes["adjusted_posterior"]
                      + weights["ml"] * ml_prob)
-            ml_block = {
-                "probability": ml_prob,
-                "confidence": ("high" if ml_prob > 0.8
-                               else "medium" if ml_prob > 0.6 else "low"),
-                "model_available": True,
-                "error": "",
-                "model_version": self.ml.meta.get(
-                    "version", Config.MODEL_VERSION),
-            }
+            ml_block = {"probability": ml_prob,
+                        "confidence": self._ml_certainty(ml_prob),
+                        "model_available": True, "error": "",
+                        "model_version": version}
 
         agreement = (ml_prob is not None
                      and abs(bayes["adjusted_posterior"] - ml_prob) <= 0.2)
-
-        overall_conf = (
-            "high" if bayes["confidence"] > 0.7 and ml_block["confidence"] == "high"
-            else "medium" if bayes["confidence"] > 0.5
-            else "low"
-        )
-        risk = "high" if final > 0.7 else "medium" if final > 0.4 else "low"
-        elapsed = time.perf_counter() - t0
+        b = bayes["confidence"]
+        if ml_prob is None:
+            overall = "medium" if b > 0.5 else "low"
+        elif b > 0.7 and ml_block["confidence"] == "high" and agreement:
+            overall = "high"
+        else:
+            overall = "medium" if b > 0.5 else "low"
 
         hybrid = {
             "final_risk_score": float(final),
-            "risk_level": risk,
+            "risk_level": risk_level(final),
             "weight_bayesian": weights["bayesian"],
             "weight_ml": weights["ml"],
             "agreement": agreement,
-            "confidence": overall_conf,
+            "confidence": overall,
             "calculation": (f"{weights['bayesian']:.0%} Bayesian + "
                             f"{weights['ml']:.0%} ML"),
         }
@@ -602,26 +898,26 @@ class HybridEngine:
             "bayesian": bayes,
             "machine_learning": ml_block,
             "hybrid_analysis": hybrid,
+            "cross_border": CrossBorderHeuristics.risk(case),
             "insights": self._insights(hybrid, case, ml_block),
             "metadata": {
                 "analysis_id": secrets.token_hex(8),
-                "timestamp": datetime.utcnow().isoformat(),
-                # FIX #9: measured, not hardcoded.
-                "analysis_time": round(elapsed, 4),
-                "model_version": ml_block["model_version"],
+                "timestamp": now_iso(),
+                "analysis_time": round(time.perf_counter() - t0, 4),
+                "model_version": version,
             },
         }
 
     @staticmethod
-    def _insights(hybrid: Dict[str, Any], case: Dict[str, Any],
-                  ml: Dict[str, Any]) -> List[str]:
+    def _insights(hybrid: Mapping[str, Any], case: Mapping[str, Any],
+                  ml: Mapping[str, Any]) -> List[str]:
         out: List[str] = []
         risk = hybrid["risk_level"]
         if risk == "high":
-            out.append("High risk -- recommend immediate investigation.")
+            out.append("High risk score -- prioritise review.")
             out.append("Consider allocating additional resources.")
         elif risk == "medium":
-            out.append("Medium risk -- standard investigation protocol.")
+            out.append("Medium risk score -- standard protocol.")
 
         ev = coerce_int(case.get("evidence_count", 0), 0, 0, 10000)
         if ev < 3:
@@ -636,53 +932,167 @@ class HybridEngine:
             out.append("Multiple suspects -- consider connection analysis.")
 
         if ml.get("model_available"):
-            if hybrid["agreement"]:
-                out.append("Strong model agreement -- high confidence.")
-            else:
-                out.append("Model divergence -- recommend manual review.")
+            out.append("Models agree." if hybrid["agreement"]
+                       else "Models diverge -- recommend manual review.")
         else:
-            out.append(f"ML unavailable ({ml.get('error', 'unknown')}); "
+            out.append(f"{ml.get('error') or 'ML unavailable'}; "
                        "score is Bayesian-only.")
 
-        year = coerce_int(case.get("year", datetime.now().year),
-                          datetime.now().year, 1900, 2100)
-        if datetime.now().year - year > 5:
-            out.append("Case aged -- consider evidence degradation.")
+        yr = coerce_int(case.get("year", datetime.now().year),
+                        datetime.now().year, 1900, 2100)
+        if datetime.now().year - yr > 5:
+            out.append("Case is aged -- consider evidence degradation.")
 
-        out.append("Case ready for detailed forensic analysis.")
+        out.append("Scores are uncalibrated decision support, not evidence; "
+                   "a human must make the decision.")
         return out
 
 
 # =============================================================================
-# INTERNATIONAL  (FIX #10: honest heuristics; no fabricated "ML" metrics.)
+# TEMPLATE DISCOVERY  (templates may live in any number of folders)
 # =============================================================================
 
-class CrossBorderHeuristics:
-    """
-    Transparent rule-based scoring. The original code called this "ML" and
-    reported an invented accuracy_estimate of 0.85 -- both removed.
-    """
+REQUIRED_TEMPLATES = ("login.html", "dashboard.html", "create_case.html",
+                      "view_case.html", "analysis.html", "train.html")
 
-    @staticmethod
-    def risk(case: Dict[str, Any]) -> Dict[str, Any]:
-        crime_risk = {
-            "violent_crime": 0.8, "sexual_violence": 0.9,
-            "terrorism": 1.0, "organized_crime": 0.7,
-            "financial_crime": 0.4, "property_crime": 0.3,
-        }.get(str(case.get("crime_category", "other_crime")), 0.5)
 
-        ev = coerce_int(case.get("evidence_count", 0), 0, 0, 10000)
-        su = coerce_int(case.get("suspects_count", 0), 0, 0, 1000)
-        score = (0.6 * crime_risk
-                 + 0.2 * min(1.0, ev / 10.0)
-                 + 0.2 * min(1.0, su / 5.0))
-        level = "HIGH" if score > 0.7 else "MEDIUM" if score > 0.4 else "LOW"
-        return {
-            "risk_score": round(score, 3),
-            "risk_level": level,
-            "method": "transparent_heuristic",
-            "factors": ["crime_category", "evidence_count", "suspects_count"],
-        }
+def discover_template_dirs() -> List[Path]:
+    """
+    Order of precedence:
+      1. folders listed in SICCA_TEMPLATE_DIRS
+      2. every folder under APP_ROOT that directly contains .html files
+      3. APP_ROOT itself (so names like "auth/login.html" also resolve)
+    """
+    found: List[Path] = []
+
+    def add(p: Path) -> None:
+        p = p.resolve()
+        if p.is_dir() and p not in found:
+            found.append(p)
+
+    for raw in os.environ.get("SICCA_TEMPLATE_DIRS", "").split(os.pathsep):
+        if raw.strip():
+            add(Path(raw).expanduser())
+
+    root = Config.APP_ROOT
+    skip = set(Config.TEMPLATE_SKIP_DIRS) | {Config.BASE_DIR.name}
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = len(Path(dirpath).relative_to(root).parts)
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in skip and not d.startswith(".")
+                             and depth < Config.TEMPLATE_SCAN_DEPTH)
+        if any(f.lower().endswith(".html") for f in filenames):
+            add(Path(dirpath))
+    add(root)
+    return found
+
+
+def template_index(dirs: List[Path]) -> Dict[str, Path]:
+    """name -> file that will actually be used (first folder wins)."""
+    index: Dict[str, Path] = {}
+    for d in dirs:
+        for f in sorted(d.glob("*.html")):
+            if f.name in index:
+                LOG.warning("Duplicate template '%s': using %s, ignoring %s",
+                            f.name, index[f.name], f)
+            else:
+                index[f.name] = f
+    return index
+
+
+def build_template_loader() -> Tuple[ChoiceLoader, Dict[str, Path]]:
+    dirs = discover_template_dirs()
+    index = template_index(dirs)
+    for name in REQUIRED_TEMPLATES:
+        if name not in index:
+            LOG.warning("Template '%s' not found in any folder; using the "
+                        "built-in fallback.", name)
+    loader = ChoiceLoader([FileSystemLoader([str(d) for d in dirs]),
+                           DictLoader(FALLBACK_TEMPLATES)])
+    return loader, index
+
+
+_CSRF = '<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">'
+
+FALLBACK_TEMPLATES = {
+    "_fallback_base.html": """<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><title>SICCA</title>
+<style>body{font:15px system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem}
+table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:.35rem .5rem;text-align:left}
+.flash{padding:.5rem .75rem;margin:.5rem 0;border-radius:4px;background:#eef}
+.error{background:#fdd}.success{background:#dfd}label{display:block;margin:.5rem 0}</style></head><body>
+{% if current_user.is_authenticated %}<nav><a href="{{ url_for('dashboard') }}">Dashboard</a> |
+<a href="{{ url_for('create_case') }}">New case</a>
+{% if current_user.is_admin() %} | <a href="{{ url_for('train_model') }}">Train model</a>{% endif %}
+<form method="post" action="{{ url_for('logout') }}" style="display:inline">""" + _CSRF + """
+<button>Log out ({{ current_user.username }})</button></form></nav>{% endif %}
+{% with msgs = get_flashed_messages(with_categories=true) %}{% for cat, m in msgs %}
+<div class="flash {{ cat }}">{{ m }}</div>{% endfor %}{% endwith %}
+{% block body %}{% endblock %}</body></html>""",
+
+    "login.html": """{% extends "_fallback_base.html" %}{% block body %}
+<h1>SICCA login</h1><form method="post">""" + _CSRF + """
+<label>Username <input name="username" required></label>
+<label>Password <input name="password" type="password" required></label>
+<button>Log in</button></form>{% endblock %}""",
+
+    "dashboard.html": """{% extends "_fallback_base.html" %}{% block body %}
+<h1>Dashboard</h1>
+<p>Total: {{ stats.total_cases }} | Open: {{ stats.open_cases }} | High priority: {{ stats.high_priority }}
+| ML model: {{ 'ready' if model_available else 'not trained' }}</p>
+<table><tr><th>ID</th><th>Name</th><th>Type</th><th>Status</th><th>Priority</th></tr>
+{% for c in cases %}<tr><td><a href="{{ url_for('view_case', case_id=c.case_id) }}">{{ c.case_id }}</a></td>
+<td>{{ c.case_name }}</td><td>{{ c.type }}</td><td>{{ c.status }}</td><td>{{ c.priority }}</td></tr>
+{% else %}<tr><td colspan="5">No cases yet.</td></tr>{% endfor %}</table>
+<p>{% if page > 1 %}<a href="?page={{ page - 1 }}">&laquo; Newer</a>{% endif %}
+{% if has_more %}<a href="?page={{ page + 1 }}">Older &raquo;</a>{% endif %}</p>{% endblock %}""",
+
+    "create_case.html": """{% extends "_fallback_base.html" %}{% block body %}
+<h1>New case</h1><form method="post" enctype="multipart/form-data">""" + _CSRF + """
+<label>Case ID <input name="case_id" value="{{ form.get('case_id','') }}" required></label>
+<label>Name <input name="case_name" value="{{ form.get('case_name','') }}" required></label>
+<label>Location <input name="location" value="{{ form.get('location','') }}"></label>
+<label>Year <input name="year" value="{{ form.get('year','') }}"></label>
+<label>Type <select name="type">{% for t in types %}<option {{ 'selected' if form.get('type')==t }}>{{ t }}</option>{% endfor %}</select></label>
+<label>Status <select name="status">{% for t in statuses %}<option {{ 'selected' if form.get('status')==t }}>{{ t }}</option>{% endfor %}</select></label>
+<label>Priority <select name="priority">{% for t in priorities %}<option {{ 'selected' if form.get('priority')==t }}>{{ t }}</option>{% endfor %}</select></label>
+<label>Confidence (0-1) <input name="confidence" value="{{ form.get('confidence','') }}"></label>
+<label>Suspects <input name="suspects_count" value="{{ form.get('suspects_count','') }}"></label>
+<label>Evidence items <input name="evidence_count" value="{{ form.get('evidence_count','') }}"></label>
+<label>Assigned to (username) <input name="assigned_to" value="{{ form.get('assigned_to','') }}"></label>
+<label>Tags <input name="tags" value="{{ form.get('tags','') }}"></label>
+<label>Description <textarea name="description" rows="4" cols="60">{{ form.get('description','') }}</textarea></label>
+<label>Attachment <input type="file" name="case_file"></label>
+<button>Create</button></form>{% endblock %}""",
+
+    "view_case.html": """{% extends "_fallback_base.html" %}{% block body %}
+<h1>{{ case.case_id }} &mdash; {{ case.case_name }}</h1>
+<table>{% for k, v in case.items() if k not in ('file_path',) %}<tr><th>{{ k }}</th><td>{{ v }}</td></tr>{% endfor %}</table>
+<p><a href="{{ url_for('analyze_case', case_id=case.case_id) }}">Run analysis</a>
+{% if case.attached_file %} | <a href="{{ url_for('download_file', case_id=case.case_id) }}">Download attachment</a>{% endif %}
+| <a href="{{ url_for('export_json', case_id=case.case_id) }}">Export JSON</a></p>{% endblock %}""",
+
+    "analysis.html": """{% extends "_fallback_base.html" %}{% block body %}
+<h1>Analysis: {{ case.case_id }}</h1>
+{% set h = result.hybrid_analysis %}
+<p><b>Risk:</b> {{ h.risk_level }} ({{ '%.2f'|format(h.final_risk_score) }}) &mdash; {{ h.calculation }};
+confidence {{ h.confidence }}</p>
+<p>Bayesian adjusted posterior: {{ '%.2f'|format(result.bayesian.adjusted_posterior) }}<br>
+ML probability: {{ '%.2f'|format(result.machine_learning.probability) if result.machine_learning.model_available else 'unavailable' }}<br>
+Cross-border heuristic: {{ result.cross_border.risk_level }} ({{ result.cross_border.risk_score }})</p>
+<ul>{% for i in result.insights %}<li>{{ i }}</li>{% endfor %}</ul>
+<p><a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a></p>{% endblock %}""",
+
+    "train.html": """{% extends "_fallback_base.html" %}{% block body %}
+<h1>Train ML model</h1>
+{% if model_meta %}<p>Current model v{{ model_meta.version }}, trained {{ model_meta.trained_at }},
+AUC {{ model_meta.metrics.roc_auc }}, accuracy {{ '%.2f'|format(model_meta.metrics.accuracy) }}.</p>
+{% else %}<p>No trained model.</p>{% endif %}
+<p>CSV columns: type, status, priority, year, suspects_count, evidence_count, label (0/1).
+Minimum {{ min_rows }} rows.</p>
+<form method="post" enctype="multipart/form-data">""" + _CSRF + """
+<input type="file" name="training_csv" accept=".csv" required> <button>Train</button></form>{% endblock %}""",
+}
 
 
 # =============================================================================
@@ -692,41 +1102,118 @@ class CrossBorderHeuristics:
 def create_app() -> Flask:
     Config.ensure_dirs()
     init_db()
+    check_risk_reachability()
 
-    app = Flask(__name__, template_folder="templates", static_folder="static")
+    app = Flask(__name__, template_folder=None,
+                static_folder=str(Config.APP_ROOT / "static"))
+    loader, _ = build_template_loader()
+    app.jinja_loader = loader  # must be set before the first render
+
     app.config.update(
         SECRET_KEY=load_or_create_secret_key(),
         MAX_CONTENT_LENGTH=Config.MAX_CONTENT_LENGTH,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=Config.COOKIE_SECURE,
         PERMANENT_SESSION_LIFETIME=Config.SESSION_LIFETIME_SECONDS,
-        WTF_CSRF_ENABLED=Config.CSRF_ENABLED,
+        WTF_CSRF_ENABLED=True,
     )
-
     CSRFProtect(app)
     login_manager.init_app(app)
     login_manager.login_view = "login"
 
-    ml = MLModel(Config.MODEL_PATH)
-    engine = HybridEngine(ml=ml)
+    ml = MLModel(Config.MODEL_PATH, Config.MODEL_HASH_PATH)
+    engine = HybridEngine(ml)
 
-    # ---------------------------------------------------------------- auth
+    # ------------------------------------------------------------ helpers
+    def can_access(row: sqlite3.Row) -> bool:
+        if current_user.is_admin():
+            return True
+        me = current_user.username.lower()
+        return (row["created_by"].lower() == me
+                or (row["assigned_to"] or "").lower() == me)
+
+    def scope() -> Tuple[str, Tuple[Any, ...]]:
+        """SQL WHERE fragment limiting rows to what the user may see."""
+        if current_user.is_admin():
+            return "1=1", ()
+        me = current_user.username.lower()
+        return "(LOWER(created_by) = ? OR LOWER(assigned_to) = ?)", (me, me)
+
+    def fetch_case(case_id: str) -> sqlite3.Row:
+        ok, _ = validate_case_id(case_id)
+        if not ok:
+            abort(404)
+        with db() as conn:
+            row = conn.execute("SELECT * FROM cases WHERE case_id = ?",
+                               (case_id,)).fetchone()
+        # 404 (not 403) so unauthorised users cannot probe which IDs exist.
+        if row is None or not can_access(row):
+            abort(404)
+        return row
+
+    def render_create(status: int = 200, **extra):
+        return render_template(
+            "create_case.html", form=request.form if request.method == "POST"
+            else {}, types=CASE_TYPES, statuses=STATUSES,
+            priorities=PRIORITIES, **extra), status
+
+    # ------------------------------------------------------------ hooks
+    @app.after_request
+    def security_headers(resp):
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("Referrer-Policy", "same-origin")
+        if current_user.is_authenticated:
+            resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.errorhandler(CSRFError)
+    def csrf_error(_exc):
+        return ("Security token missing or expired. Go back, reload the "
+                "page and try again.", 400)
+
+    @app.errorhandler(413)
+    def too_large(_exc):
+        mb = Config.MAX_CONTENT_LENGTH // (1024 * 1024)
+        return f"Upload too large (limit {mb} MB).", 413
+
+    # ------------------------------------------------------------ auth
     @app.route("/login", methods=["GET", "POST"])
     def login():
+        if current_user.is_authenticated:
+            return redirect(url_for("dashboard"))
         if request.method == "POST":
             username = clean_text(request.form.get("username"), 100)
             password = request.form.get("password", "")
+            ip = request.remote_addr or "?"
+            k_user, k_ip = f"u:{ip}|{username.lower()}", f"ip:{ip}"
+            wait = max(THROTTLE.wait_seconds(k_user, 5),
+                       THROTTLE.wait_seconds(k_ip, 30))
+            if wait:
+                flash(f"Too many failed attempts. Try again in "
+                      f"{wait // 60 + 1} minute(s).", "error")
+                return render_template("login.html"), 429
+
             with db() as conn:
                 row = conn.execute(
                     "SELECT id, username, password, role FROM users "
-                    "WHERE username = ?", (username,),
-                ).fetchone()
-            if row and check_password_hash(row["password"], password):
+                    "WHERE username = ?", (username,)).fetchone()
+            valid = check_password_hash(
+                row["password"] if row else _DUMMY_HASH, password)
+            if row and valid:
+                THROTTLE.clear(k_user)
+                session.clear()  # avoid session fixation
                 login_user(User(row["id"], row["username"], row["role"]))
                 session.permanent = True
-                audit(username, "login", username)
+                audit(row["username"], "login", row["username"])
                 return redirect(url_for("dashboard"))
+
+            THROTTLE.fail(k_user)
+            THROTTLE.fail(k_ip)
+            LOG.warning("Failed login for '%s' from %s", username[:50], ip)
             flash("Invalid credentials", "error")
+            return render_template("login.html"), 401
         return render_template("login.html")
 
     @app.route("/logout", methods=["POST"])
@@ -734,9 +1221,10 @@ def create_app() -> Flask:
     def logout():
         audit(current_user.username, "logout", current_user.username)
         logout_user()
+        session.clear()
         return redirect(url_for("login"))
 
-    # ---------------------------------------------------------------- dashboard
+    # ------------------------------------------------------------ dashboard
     @app.route("/")
     @login_required
     def index():
@@ -745,125 +1233,252 @@ def create_app() -> Flask:
     @app.route("/dashboard")
     @login_required
     def dashboard():
+        try:
+            page = max(1, int(request.args.get("page", "1")))
+        except ValueError:
+            page = 1
+        where, params = scope()
+        size = Config.PAGE_SIZE
         with db() as conn:
             rows = conn.execute(
-                "SELECT * FROM cases ORDER BY modified DESC LIMIT 200"
-            ).fetchall()
-            total = conn.execute("SELECT COUNT(*) AS n FROM cases").fetchone()["n"]
+                f"SELECT * FROM cases WHERE {where} "
+                "ORDER BY modified DESC LIMIT ? OFFSET ?",
+                params + (size + 1, (page - 1) * size)).fetchall()
+            total = conn.execute(
+                f"SELECT COUNT(*) AS n FROM cases WHERE {where}",
+                params).fetchone()["n"]
             open_n = conn.execute(
-                "SELECT COUNT(*) AS n FROM cases WHERE status = 'open'"
-            ).fetchone()["n"]
+                f"SELECT COUNT(*) AS n FROM cases WHERE {where} "
+                "AND LOWER(status) = 'open'", params).fetchone()["n"]
             high_n = conn.execute(
-                "SELECT COUNT(*) AS n FROM cases WHERE priority = 'high'"
-            ).fetchone()["n"]
-        stats = {"total_cases": total, "open_cases": open_n,
-                 "high_priority": high_n}
-        return render_template("dashboard.html",
-                               cases=[dict(r) for r in rows],
-                               stats=stats,
-                               model_available=ml.exists())
+                f"SELECT COUNT(*) AS n FROM cases WHERE {where} "
+                "AND LOWER(priority) = 'high'", params).fetchone()["n"]
+        return render_template(
+            "dashboard.html",
+            cases=[dict(r) for r in rows[:size]],
+            stats={"total_cases": total, "open_cases": open_n,
+                   "high_priority": high_n},
+            model_available=ml.exists(),
+            page=page, has_more=len(rows) > size)
 
-    # ---------------------------------------------------------------- create
+    # ------------------------------------------------------------ create
     @app.route("/create_case", methods=["GET", "POST"])
     @login_required
     def create_case():
-        if request.method == "POST":
+        if request.method == "GET":
+            return render_create()
+
+        saved_path: Optional[Path] = None
+        try:
             case_id = clean_text(request.form.get("case_id"), 50)
             ok, msg = validate_case_id(case_id)
             if not ok:
-                flash(msg, "error")
-                return render_template("create_case.html"), 400
+                raise FormError(msg)
+            record = build_case_record(request.form, case_id,
+                                       current_user.username)
+            upload = prepare_upload(request.files.get("case_file"), case_id)
+        except FormError as exc:
+            flash(str(exc), "error")
+            return render_create(400)
 
-            # FIX #5: validate BEFORE saving the file to disk.
-            file = request.files.get("case_file")
-            saved_path = None
-            attached = None
-            if file and file.filename:
-                ext = Path(file.filename).suffix.lower()
-                if ext not in Config.ALLOWED_UPLOAD_EXTENSIONS:
-                    flash(f"File type {ext} not allowed", "error")
-                    return render_template("create_case.html"), 400
-                safe_name = safe_upload_name(case_id, file.filename)
-                saved_path = Config.UPLOADS_DIR / safe_name
-                file.save(saved_path)
-                attached = file.filename
-
-            now = datetime.utcnow().isoformat()
-            record = {
-                "case_id": case_id,
-                "case_name": clean_text(request.form.get("case_name"), 200),
-                "location": clean_text(request.form.get("location"), 200),
-                "year": coerce_int(request.form.get("year"),
-                                   datetime.now().year, 1900, 2100),
-                "type": clean_text(request.form.get("type", "unknown"), 40),
-                "status": clean_text(request.form.get("status", "open"), 40),
-                "confidence": coerce_float(request.form.get("confidence"),
-                                           0.5, 0.0, 1.0),
-                "suspects_count": coerce_int(
-                    request.form.get("suspects_count"), 0, 0, 1000),
-                "evidence_count": coerce_int(
-                    request.form.get("evidence_count"), 0, 0, 10000),
-                "description": clean_text(
-                    request.form.get("description"), 5000),
-                "priority": clean_text(
-                    request.form.get("priority", "medium"), 20),
-                "assigned_to": clean_text(
-                    request.form.get("assigned_to"), 100),
-                "tags": clean_text(request.form.get("tags"), 500),
-                "attached_file": attached,
-                "file_path": str(saved_path) if saved_path else None,
-                "created": now,
-                "modified": now,
-            }
-
-            try:
-                with db() as conn:
-                    conn.execute(
-                        """INSERT INTO cases (case_id, case_name, location,
-                        year, type, status, confidence, suspects_count,
-                        evidence_count, description, priority, assigned_to,
-                        tags, attached_file, file_path, created, modified)
-                        VALUES (:case_id, :case_name, :location, :year, :type,
-                        :status, :confidence, :suspects_count, :evidence_count,
-                        :description, :priority, :assigned_to, :tags,
-                        :attached_file, :file_path, :created, :modified)""",
-                        record,
-                    )
-                    conn.commit()
-                audit(current_user.username, "create_case", case_id)
-                flash(f"Case {case_id} created.", "success")
-                return redirect(url_for("view_case", case_id=case_id))
-            except sqlite3.IntegrityError:
+        with db() as conn:
+            if conn.execute("SELECT 1 FROM cases WHERE case_id = ?",
+                            (case_id,)).fetchone():
                 flash("Case ID already exists", "error")
-                return render_template("create_case.html"), 409
-            except Exception as exc:
-                # FIX #17: do not swallow; surface to the user.
-                LOG.exception("Failed to write case")
-                flash(f"Failed to save case: {exc}", "error")
-                return render_template("create_case.html"), 500
+                return render_create(409)
 
-        return render_template("create_case.html")
+        try:
+            if upload:
+                file, stored, display = upload
+                saved_path = Config.UPLOADS_DIR / stored
+                file.save(saved_path)
+                record["attached_file"] = display
+                record["file_path"] = stored  # relative to UPLOADS_DIR
+            with db() as conn:
+                conn.execute(
+                    """INSERT INTO cases (case_id, case_name, location, year,
+                    type, status, confidence, suspects_count, evidence_count,
+                    description, priority, assigned_to, tags, attached_file,
+                    file_path, created_by, created, modified)
+                    VALUES (:case_id, :case_name, :location, :year, :type,
+                    :status, :confidence, :suspects_count, :evidence_count,
+                    :description, :priority, :assigned_to, :tags,
+                    :attached_file, :file_path, :created_by, :created,
+                    :modified)""", record)
+                audit(current_user.username, "create_case", case_id,
+                      conn=conn)
+        except sqlite3.IntegrityError:  # lost a race on the primary key
+            _discard(saved_path)
+            flash("Case ID already exists", "error")
+            return render_create(409)
+        except Exception:
+            _discard(saved_path)
+            ref = secrets.token_hex(4)
+            LOG.exception("Failed to save case %s (ref %s)", case_id, ref)
+            flash(f"Could not save the case. Reference: {ref}", "error")
+            return render_create(500)
 
-    # ---------------------------------------------------------------- view
+        flash(f"Case {case_id} created.", "success")
+        return redirect(url_for("view_case", case_id=case_id))
+
+    # ------------------------------------------------------------ view
     @app.route("/case/<case_id>")
     @login_required
     def view_case(case_id: str):
-        with db() as conn:
-            row = conn.execute("SELECT * FROM cases WHERE case_id = ?",
-                               (case_id,)).fetchone()
-        if not row:
-            abort(404)
-        return render_template("view_case.html", case=dict(row))
+        return render_template("view_case.html",
+                               case=dict(fetch_case(case_id)))
 
-    # ---------------------------------------------------------------- analyze
+    @app.route("/case/<case_id>/file")
+    @login_required
+    def download_file(case_id: str):
+        row = fetch_case(case_id)
+        if not row["file_path"]:
+            abort(404)
+        root = Config.UPLOADS_DIR.resolve()
+        target = (root / row["file_path"]).resolve()
+        if root not in target.parents or not target.is_file():
+            abort(404)
+        audit(current_user.username, "download_file", case_id)
+        return send_file(target, as_attachment=True,
+                         download_name=row["attached_file"] or target.name)
+
+    # ------------------------------------------------------------ analysis
     @app.route("/analyze/<case_id>")
     @login_required
     def analyze_case(case_id: str):
-        with db() as conn:
-            row = conn.execute("SELECT * FROM cases WHERE case_id = ?",
-                               (case_id,)).fetchone()
-        if not row:
-            abort(404)
+        row = fetch_case(case_id)
         result = engine.analyze(dict(row))
-        audit(current_user.username, "analyze", case_id)
-        return
+        if request.args.get("format") == "json":
+            return jsonify(result)
+        return render_template("analysis.html", case=dict(row), result=result)
+
+    @app.route("/export/<case_id>.json")
+    @login_required
+    def export_json(case_id: str):
+        row = fetch_case(case_id)
+        payload = {"case": {k: v for k, v in dict(row).items()
+                            if k != "file_path"},
+                   "analysis": engine.analyze(dict(row))}
+        audit(current_user.username, "export_json", case_id)
+        resp = jsonify(payload)
+        resp.headers["Content-Disposition"] = (
+            f'attachment; filename="{secure_filename(case_id)}.json"')
+        return resp
+
+    # ------------------------------------------------------------ admin
+    @app.route("/admin/train", methods=["GET", "POST"])
+    @admin_required
+    def train_model():
+        if request.method == "POST":
+            f = request.files.get("training_csv")
+            if not f or not f.filename.lower().endswith(".csv"):
+                flash("Upload a .csv file.", "error")
+                return _train_page(400)
+            try:
+                df = pd.read_csv(f.stream, nrows=200_000)
+            except Exception:
+                flash("Could not read that CSV file.", "error")
+                return _train_page(400)
+            try:
+                m = ml.train(df)
+            except ValueError as exc:
+                flash(str(exc), "error")
+                return _train_page(400)
+            except Exception:
+                ref = secrets.token_hex(4)
+                LOG.exception("Training failed (ref %s)", ref)
+                flash(f"Training failed. Reference: {ref}", "error")
+                return _train_page(500)
+            audit(current_user.username, "train_model", "model",
+                  f"rows={m['training_samples'] + m['test_samples']} "
+                  f"auc={m['roc_auc']}")
+            auc = "n/a" if m["roc_auc"] is None else f"{m['roc_auc']:.3f}"
+            flash(f"Model trained. Test AUC {auc}, accuracy "
+                  f"{m['accuracy']:.3f} on {m['test_samples']} held-out "
+                  "rows.", "success")
+            return redirect(url_for("train_model"))
+        return _train_page()
+
+    def _train_page(status: int = 200):
+        return render_template("train.html", model_meta=ml.meta,
+                               min_rows=Config.MIN_TRAIN_ROWS), status
+
+    return app
+
+
+def _discard(path: Optional[Path]) -> None:
+    """Remove a just-saved upload after a failed insert."""
+    if path is not None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            LOG.warning("Could not remove orphaned upload %s", path)
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="sicca_app.py")
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("run", help="start the web server (default)")
+    cu = sub.add_parser("create-user", help="add a user")
+    cu.add_argument("username")
+    cu.add_argument("--role", choices=["analyst", "admin"], default="analyst")
+    tr = sub.add_parser("train", help="train the ML model from a CSV")
+    tr.add_argument("csv")
+    sub.add_parser("check-templates", help="show where templates are found")
+    args = parser.parse_args(argv)
+    cmd = args.cmd or "run"
+
+    if cmd == "check-templates":
+        _, index = build_template_loader()
+        for name in REQUIRED_TEMPLATES:
+            print(f"{name:20s} -> {index.get(name, 'MISSING (built-in fallback)')}")
+        extra = sorted(set(index) - set(REQUIRED_TEMPLATES))
+        if extra:
+            print("\nOther templates found:")
+            for name in extra:
+                print(f"  {name:28s} {index[name]}")
+        return 0
+
+    init_db()
+
+    if cmd == "create-user":
+        pw = getpass.getpass("Password: ")
+        if pw != getpass.getpass("Repeat password: "):
+            print("Passwords do not match.", file=sys.stderr)
+            return 1
+        try:
+            create_user(args.username, pw, args.role)
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Created {args.role} '{args.username}'.")
+        return 0
+
+    if cmd == "train":
+        model = MLModel(Config.MODEL_PATH, Config.MODEL_HASH_PATH)
+        try:
+            m = model.train(pd.read_csv(args.csv))
+        except (ValueError, OSError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Trained v{m['model_version']}: AUC={m['roc_auc']} "
+              f"accuracy={m['accuracy']:.3f} "
+              f"(train {m['training_samples']}, test {m['test_samples']})")
+        return 0
+
+    # run
+    if Config.DEBUG and Config.HOST not in LOOPBACK_HOSTS:
+        print("Refusing to run with SICCA_DEBUG=1 on a non-loopback host: "
+              "the Werkzeug debugger allows remote code execution.",
+              file=sys.stderr)
+        return 1
+    create_app().run(host=Config.HOST, port=Config.PORT, debug=Config.DEBUG)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
