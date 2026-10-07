@@ -1,363 +1,1562 @@
 
-In-Depth Report on SICCA (Sistema
-Integrado de Casos Crímenes en Archivo)
-1. System Overview
-SICCA is an offline investigative intelligence platform designed to manage, analyze, and
-prioritize criminal cases. It integrates case management with advanced analytical modules,
-combining Bayesian probability updating, exponential temporal decay, and NLP-based MO
-similarity to deliver structured insights.
-2. How It Works
-1. Case Input
-• Users create cases manually or upload via CSV.
-• Each case includes ID, name, location, description, and type.
-• Cases can be linked to show relationships.2. Database Storage
-• SQLite database stores cases, users, links, and analysis outputs.
-• Role-based permissions ensure secure collaboration.
-3. Analysis Engine
-• Bayesian Probability Updating: Combines temporal, geographic, and MO evidence
-into posterior probabilities.
-• Confidence Scoring: Applies exponential decay and evidence weighting.
-• Risk Assessment: Logistic mapping ensures realistic escalation.
-• Specialized Modules: Terrorist Networks, Missing Persons, Cold Cases, Serial
-Killer Profiling.
-4. Outputs
-• Dashboard summaries.
-• CSV exports for external reporting.
-• Logs for audit trails.
-3. What It Does
-• Quantifies case linkages using probability and confidence.
-• Maps networks to identify leaders, bridges, and vulnerabilities.
-• Prioritizes search areas in missing person investigations.
-• Identifies investigative gaps in cold cases.
-• Profiles offenders in serial killer investigations.
-4. Outcomes
-• Probabilistic Scores: Posterior probabilities of case linkages.
-• Confidence Levels: Adjusted for evidence strength and time decay.
-• Risk Scores: Logistic risk values for prioritization.
-• Module-Specific Insights:
-• Terrorist networks → structural vulnerabilities.
-• Missing persons → efficient resource allocation.
-• Cold cases → methodological recommendations.
-• Serial killers → offender profile indicators.
-5. Reliability of Outcomes
-• Strengths:• Bayesian updating ensures evidence is combined rationally.
-• Exponential decay models time relevance realistically.
-• NLP MO similarity captures nuanced behavioral overlaps.
-• Limitations:
-• Operates offline → no live GIS or external intelligence feeds.
-• NLP is heuristic (TF-IDF) → less precise than deep learning embeddings.
-• Reliability depends on quality of input data (case descriptions, links).
-• Overall: Reliable for pattern detection and prioritization, but should be used as decision
-support, not as sole evidence.
-6. Illustrative Made-Up Cases
-A. Terrorist Network Analysis
-Case:
-• Case A: Bombing in Madrid, 2020.
-• Case B: Safe house discovered in Valencia, 2021.
-• Case C: Financing operation in Barcelona, 2022.
-Outcome:
-• Bayesian probability links A and B strongly (temporal + geographic overlap).
-• Network analysis shows Case B as a bridge node connecting A and C.
-• Vulnerability: Safe house (Case B) is a weak point; dismantling it disrupts the network.
-B. Missing Person Prediction
-Case:
-• Case D: Missing hiker in Sierra de Guadarrama, last seen November 2025.
-• Location predictions: trailhead (0.7 confidence), river crossing (0.6), mountain ridge (0.4).
-Outcome:
-• Efficiency scores rank trailhead highest.
-• Recommended resource allocation: 6 units to trailhead, 3 to river, 1 to ridge.
-• Search prioritization increases likelihood of recovery.
-C. Cold Case Gap Analysis
-Case:
-• Case E: Unsolved homicide from 1995, limited forensic methods used.
-• Similar solved cases (2005–2015) used DNA genealogy and digital forensics.Outcome:
-• Gap analysis identifies missing techniques: advanced DNA, digital trace recovery.
-• Recommendation: Re-examine evidence with genealogy DNA and digital forensics.
-• Confidence: 0.7 (based on similarity to solved cases).
-D. Serial Killer Profiling
-Case:
-• Case F: Victim found in Toledo, strangulation, body posed.
-• Case G: Victim in Ciudad Real, strangulation, ritualistic staging.
-Outcome:
-• MO similarity: 0.85 (high overlap).
-• Geographic profiling: both within 100 km radius.
-• Signature behaviors: posing, ritual detected.
-• Composite offender profile score: 0.92 → strong indication of serial offender.
-SICCA provides a structured, probabilistic, and modular framework for criminal case analysis.
-• It does not replace investigators, but enhances their ability to detect patterns, allocate
-resources, and prioritize leads.
-• Reliability is high when input data is rich and accurate, moderate when descriptions are
-sparse.
-• The system is best used as a decision support tool integrated into investigative workflow1. Security & Confidentiality
-• Offline = air-gapped: No internet connection means sensitive case data cannot leak or be
-intercepted.• Chain of custody: Evidence remains entirely within the organization’s controlled
-environment.
-• Compliance: Easier to meet strict legal/privacy regulations (e.g., GDPR, national security
-protocols).
-⚡ 2. Reliability & Availability
-• No dependency on internet: Investigators can work in remote areas, secure facilities, or
-during outages.
-• Always accessible: The system runs locally; uptime is controlled by your own hardware.
-• Predictable performance: No latency or bandwidth issues from cloud servers.
-🛠️ 3. Control & Customization
-• Full ownership: You decide how the database is structured, backed up, and maintained.
-• Custom algorithms: You can adapt Bayesian updating, NLP similarity, or risk scoring
-without waiting for vendor updates.
-• Integration freedom: Easier to connect with local forensic tools, GIS systems, or secure
-archives.
-🧠 4. Investigator Trust
-• Transparency: Analysts can see exactly how probabilities are calculated (Bayesian,
-exponential decay, TF-IDF).
-• No “black box” cloud AI: Offline models are deterministic and auditable.
-• Confidence in outcomes: Investigators know results are generated from their own data, not
-mixed with external sources.
-📊 5. Practical Example
-Imagine you’re analyzing a terrorist cell case:
-• Online system → might rely on external feeds, risking exposure of your investigation.
-• Offline SICCA → runs Bayesian probability on your local case data, maps the network, and
-outputs vulnerabilities without ever leaving your secure environment.
-• Result: You can brief your team with confidence that nothing leaked.
-⚖️ 6. When Online Might Be Useful
-To be fair, cloud systems can offer:
-• Real-time intelligence feeds.
-• Scalable compute for massive datasets.• Easier collaboration across agencies.
-But in high-sensitivity investigations (terrorism, organized crime, serial killers), the offline model
-wins because security, control, and trust outweigh convenience.
-📊 Offline vs Online Investigative Systems
-Feature / Factor
-Offline SICCA (Local)
-Online / Cloud System
-Data Security
-Air-gapped, no internet exposure.
-Sensitive data stays local.
-Risk of leaks, breaches, or
-unauthorized access via network.
-Confidentiality
-Full control, meets strict legal/privacy
-requirements.
-Data often stored on third-party
-servers, harder to guarantee.
-Reliability
-Works anywhere, even in secure
-facilities or remote areas.
-Dependent on internet connectivity
-and cloud uptime.
-Performance
-Predictable, no latency or bandwidth
-issues.
-Can suffer from lag, downtime, or
-throttling.
-Control &
-Customization
-Full ownership of database, algorithms,
-and workflows.
-Vendor-controlled; customization
-limited.
-Transparency
-Algorithms are auditable (Bayesian,
-exponential decay, NLP).
-Often “black box” AI models with
-limited visibility.
-Trust by
-Investigators
-Results generated from your own data
-only.
-May mix with external feeds; trust
-issues possible.
-Scalability
-Limited to local hardware capacity.
-Cloud can scale to massive datasets.
-Collaboration
-Role-based permissions within secure
-environment.
-Easier cross-agency collaboration,
-but less secure.
-Best Use Case
-High-sensitivity investigations
-(terrorism, organized crime, serial
-killers).
-Broad intelligence sharing,
-large-scale analytics.
-• Offline SICCA is better when confidentiality, reliability, and investigator trust are
-paramount.
-• Online systems are useful for scalability and cross-agency collaboration, but they trade
-off security and control.
-• For cases like terrorism, organized crime, or serial killers, offline wins because leaks or
-breaches could compromise lives and investigationsCross-match probability: how high scores emerge and how to use them
-This digs into how SICCA assigns a high probability to a person or pattern that wasn’t yet a formal
-suspect, and how to act on that signal across terrorism, serial homicide, and missing person
-contexts.
-Probability engine overview
-• Bayesian core: SICCA starts with a prior probability and updates it with evidence turned
-into likelihood ratios.
-O_{\text{prior}}=\frac{P_{\text{prior}}}{1-P_{\text{prior}}},\quad O_{\text{post}}=O_{\
-text{prior}}\cdot \prod_i \text{LR}_i,\quad P_{\text{post}}=\frac{O_{\text{post}}}{1+O_{\
-text{post}}}
-• Evidence signals: Temporal proximity, geographic proximity, and MO/behavioral similarity
-are mapped into \text{LR}_i via a monotonic function \text{LR}(s)=\frac{\varepsilon+s}{\
-varepsilon+(1-s)}, where s\in[0,1] is the signal score and \varepsilon is a stabilizer.
-• Confidence layering: Posterior probability is tempered by exponential time decay and
-evidence/source reliability.
-C = P_{\text{post}}\cdot e^{-\lambda t}\cdot f_{\text{source}}\cdot f_{\text{evidence}}
-• Risk mapping: A logistic function compresses combined signals into an operational risk
-score.
-R=\frac{1}{1+e^{-(\alpha P_{\text{post}}+\beta C+\gamma E)}}
-Evidence signals that push a “non-suspect” to a high score
-• Temporal proximity (exp. decay):
-• Effect: Recent, clustered events increase s_{\text{temp}}.
-• Mechanism:
-s_{\text{temp}}=e^{-\lambda_{\text{temp}} \cdot \Delta t}
-• Geographic proximity (heuristic distance):
-• Effect: Repeated presence, shared locales, or feasible travel corridors raise s_{\
-text{geo}}.
-• Mechanism: Without live GIS, SICCA uses anchor-location heuristics and soft
-bonuses.
-• MO/behavioral similarity (offline NLP TF-IDF):
-• Effect: Textual MO overlap (phrases, scene features, modus keywords) increases
-s_{\text{mo}}.
-• Mechanism: Cosine similarity of TF-IDF vectors between case narratives.High posterior probability arises when these signals align consistently; each converts to an LR
-above 1, so their product lifts the odds. Even if the person wasn’t flagged before, consistent
-intersections across time, space, and behavior can surface them.
-Interpreting a high score for cross-match candidates
-• Posterior probability P_{\text{post}}: Indicates how likely the candidate is linked to the
-case set given current evidence. It is not guilt; it’s linkage likelihood.
-• Confidence C: Reliability-adjusted view. A high P_{\text{post}} with low C warns that
-time decay or weak sources might overstate the link.
-• Risk R: Prioritization metric for operational attention; high R elevates triage, not
-conclusions.
-• Thresholds:
-• Screening threshold: When P_{\text{post}} \geq 0.65 and C \geq 0.55, candidate
-moves to “investigative review.”
-• Action threshold: When P_{\text{post}} \geq 0.80 and C \geq 0.65, assign targeted
-checks (records, alibi verification, geofence review).
-• False positives vs stability: A single strong signal can spike scores; require multi-signal
-convergence or repeated corroboration across cases to reduce spurious hits.
-Worked examples by module
-Terrorist cross-match (non-suspect operative)
-• Signals:
-• Temporal: Three incidents within 7 months → s_{\text{temp}} \approx 0.50
-• Geographic: Presence across Madrid/Valencia anchors → s_{\text{geo}}=0.70
-• MO (NLP): “safe house”, “explosive precursor”, “courier” overlap → s_{\
-text{mo}}=0.75
-• LRs:
-\text{LR}_{\text{temp}}\approx \frac{0.05+0.50}{0.05+0.50}=1.00,\quad \text{LR}_{\
-text{geo}}\approx \frac{0.05+0.70}{0.05+0.30}\approx 1.75,\quad \text{LR}_{\text{mo}}\
-approx \frac{0.05+0.75}{0.05+0.25}\approx 2.67
-• Bayesian update (prior P_0=0.12):
-O_0=\frac{0.12}{0.88}\approx 0.136,\quad O_{\text{post}}=0.136 \times 1.00 \times 1.75 \times
-2.67 \approx 0.635
-P_{\text{post}}=\frac{0.635}{1+0.635}\approx 0.388
-• Confidence: If sources are strong and events recent (t=1\,\text{yr},\lambda=0.08), with
-evidence factor E=0.65:
-C \approx 0.388 \cdot e^{-0.08} \cdot 0.9 \cdot 0.65 \approx 0.21• Interpretation: Moderate posterior but modest confidence suggests targeted verification
-(travel logs, associates) before escalation. If additional MO texts increase s_{\text{mo}} to
-0.85, P_{\text{post}} can exceed 0.50 rapidly.
-Serial killer cross-match (emerging pattern offender)
-• Signals:
-• Temporal: Two homicides 5 weeks apart → s_{\text{temp}}\approx 0.67
-• Geographic: 40–90 km corridor consistent with journey-to-crime → s_{\
-text{geo}}=0.65
-• MO (NLP): “strangulation”, “posing”, “dump site staging” → s_{\text{mo}}=0.82
-• LRs:
-\text{LR}_{\text{temp}}\approx \frac{0.05+0.67}{0.05+0.33}\approx 1.86,\quad \text{LR}_{\
-text{geo}}\approx \frac{0.05+0.65}{0.05+0.35}\approx 1.67,\quad \text{LR}_{\text{mo}}\
-approx \frac{0.05+0.82}{0.05+0.18}\approx 3.25
-• Bayesian update:
-O_{\text{post}}=0.136 \times 1.86 \times 1.67 \times 3.25 \approx 1.37,\quad P_{\text{post}}=\
-frac{1.37}{1+1.37}\approx 0.58
-• Confidence: With recent events and reliable sources (t=0.1\,\text{yr}):
-C \approx 0.58 \cdot e^{-0.008} \cdot 0.9 \cdot 0.75 \approx 0.35
-• Interpretation: The pattern (MO + corridor) pushes a non-suspect to high linkage
-likelihood; next steps include victimology clustering, vehicle checks in the corridor, and
-surveillance on dump-site egress points.
-Missing person cross-match (person of interest tied to disappearance)
-• Signals:
-• Temporal: Missing event aligns with candidate’s known presence (same weekend)
-→ s_{\text{temp}}=0.60
-• Geographic: Candidate’s phone last ping near trailhead → s_{\text{geo}}=0.75
-• Behavioral/Narrative: TF-IDF similarity with witness notes (“gave ride”, “late
-night”, “river crossing”) → s_{\text{mo}}=0.70
-• LRs:
-\text{LR}_{\text{temp}}\approx 1.50,\quad \text{LR}_{\text{geo}}\approx 2.38,\quad \
-text{LR}_{\text{mo}}\approx 2.33
-• Bayesian update:
-O_{\text{post}}=0.136 \times 1.50 \times 2.38 \times 2.33 \approx 1.12,\quad P_{\text{post}}\
-approx 0.53
-• Confidence: If data is mixed quality (f_{\text{source}}=0.75, E=0.60, t=0.5\,\text{yr}):C \approx 0.53 \cdot e^{-0.04} \cdot 0.75 \cdot 0.60 \approx 0.23
-• Interpretation: Solid probability of linkage but cautious confidence; proceed with interview
-scheduling, route reconstruction, and resource prioritization near the trailhead.
-Reliability, safeguards, and escalation
-• Reliability drivers:
-• Multi-signal convergence: Temporal + geographic + MO alignment is stronger than
-any one alone.
-• Recency: Exponential decay avoids over-weighting old coincidences.
-• Text richness: Detailed narratives improve TF-IDF discrimination and reduce false
-matches.
-• Safeguards against false positives:
-• Minimum corroboration rule: Require at least two independent signals above 0.65
-to move past screening.
-• Stability checks: Recompute with updated corpus to confirm score persistence.
-• Audit trail: Every update logs signals and LRs; reviewers can trace why a score
-rose.
-• Escalation protocol when a non-suspect scores high:
-• Tier 1 — Verification: Identity, timeline, presence, benign explanations.
-• Tier 2 — Context: Associates, communications, vehicle/travel feasibility, proximity
-to scenes.
-• Tier 3 — Directed inquiries: Interviews, targeted records, surveillance (as legally
-appropriate).
-• Tier 4 — Reassessment: Recalculate P_{\text{post}} and C with new information;
-de-escalate if signals fall.
-Practical takeaways
-• High probability ≠ guilt: It signals linkage likelihood and prioritizes attention; pair with
-human judgment and lawful procedures.
-• Chase convergence, not spikes: A candidate consistently near cases in time, space, and
-behavior deserves review more than one-off hits.
-• Use confidence as a brake: If confidence lags, gather better sources before heavy action.
-• Document decisions: The audit log and thresholds help ensure consistent, defensible
-casework. ┌─────────────────────────────┐
-│ User Input │
-│ • Create Case │
-│ • Upload CSV │
-│ • Link Cases │
-└───────────────┬─────────────┘
-│
-▼
-┌─────────────────────────────┐
-│ Case Database │
-│ • Cases & Links │
-│ • Users & Roles │
-│ • Analysis Tables │
-└───────────────┬─────────────┘
-│
-▼
-┌───────────────────────────────────────────────┐
-│ Analysis Engine │
-│ │
-│ Bayesian Probability Updating │
-│ • Temporal (exponential decay) │
-│ • Geographic (distance heuristic) │
-│ • MO Similarity (offline NLP TF-IDF) │
-│ │
-│ Specialized Modules: │
-│ • Terrorist Network Analysis │
-│ • Missing Person Prediction │
-│ • Cold Case Gap Analysis │
-│ • Serial Killer Profiling │
-└───────────────┬───────────────────────────────┘
-│
-▼
-┌─────────────────────────────┐
-│ Outcomes │
-│ • Posterior Probabilities │
-│ • Confidence Scores │ │ • Risk Assessments │
-│ • Module-specific insights │
-└───────────────┬─────────────┘
-│
-▼
-┌─────────────────────────────┐
-│ Outputs & Reports │
-│ • Dashboard Summaries │
-│ • CSV Exports │
-│ • Audit Logs │
-└─────────────────────────────┘
+# SICCA
+
+## Sistema Integrado de Casos Crímenes en Archivo
+
+### In-Depth System, Methodology and Analytical Framework
+
+---
+
+# 1. System Overview
+
+**SICCA** is an offline investigative intelligence platform designed to **manage, analyse, cross-reference, and prioritise criminal cases**.
+
+The system integrates case management with advanced analytical modules, combining:
+
+* Bayesian probability updating
+* Exponential temporal decay
+* Geographic relationship analysis
+* NLP-based modus operandi (MO) similarity
+* Confidence scoring
+* Risk assessment
+* Network analysis
+* Case prioritisation
+* Module-specific analytical functions
+
+SICCA is designed to provide structured, probabilistic insights that can assist investigators in identifying relationships between cases, prioritising investigative resources, detecting patterns, and identifying potential investigative gaps.
+
+The system is intended as **decision-support technology**. It does not replace investigators, investigative judgment, evidence, or lawful investigative procedures.
+
+---
+
+# 2. How SICCA Works
+
+SICCA follows a structured analytical workflow beginning with case input and ending with analytical outputs and auditable reports.
+
+## 2.1 Case Input
+
+Users can:
+
+* Create cases manually
+* Upload cases using CSV files
+* Link cases to establish relationships between them
+
+Each case can include:
+
+* Case ID
+* Case name
+* Location
+* Description
+* Case type
+* Links to other cases
+
+This structure allows individual cases to be analysed independently while also allowing relationships and patterns across multiple cases to be examined.
+
+---
+
+# 3. Database Storage
+
+SICCA uses an **SQLite database** to store:
+
+* Cases
+* Users
+* Case relationships/links
+* Analysis results
+* Relevant analytical outputs
+
+Role-based permissions are incorporated to support controlled collaboration between authorised users.
+
+The local database architecture allows sensitive investigative information to remain within the organisation's controlled environment.
+
+---
+
+# 4. Analysis Engine
+
+The SICCA analysis engine combines several analytical methods.
+
+## 4.1 Bayesian Probability Updating
+
+The Bayesian component combines evidence-related signals including:
+
+* Temporal relationships
+* Geographic relationships
+* Modus operandi similarity
+
+These signals are used to calculate posterior probabilities representing the estimated likelihood of a relationship between cases or investigative entities based on the information currently available.
+
+## 4.2 Confidence Scoring
+
+Confidence scoring adjusts the analytical result according to factors including:
+
+* Evidence strength
+* Source reliability
+* Temporal relevance
+* Exponential time decay
+
+This creates a distinction between a high analytical score and the degree of confidence that should be placed in that score.
+
+## 4.3 Risk Assessment
+
+SICCA uses logistic mapping to convert combined analytical signals into an operational risk score.
+
+The purpose of the risk score is **prioritisation**, rather than establishing guilt or criminal responsibility.
+
+## 4.4 NLP-Based MO Similarity
+
+SICCA uses offline Natural Language Processing to compare case descriptions and identify similarities in:
+
+* Modus operandi
+* Behavioural descriptions
+* Scene characteristics
+* Relevant terminology
+* Repeated textual patterns
+
+The current implementation uses **TF-IDF and cosine similarity**.
+
+## 4.5 Specialized Analytical Modules
+
+SICCA includes specialised analytical modules for:
+
+* Terrorist Network Analysis
+* Missing Person Prediction
+* Cold Case Gap Analysis
+* Serial Killer Profiling
+
+---
+
+# 5. Outputs
+
+SICCA produces several forms of analytical output.
+
+### Dashboard Summaries
+
+The dashboard provides structured summaries of case information and analytical results.
+
+### CSV Exports
+
+Analytical results can be exported in CSV format for external reporting and further analysis.
+
+### Audit Logs
+
+Relevant system actions and analytical updates can be recorded in audit logs, allowing reviewers to trace how results were generated and changed.
+
+---
+
+# 6. What SICCA Does
+
+SICCA is designed to:
+
+### Quantify Case Linkages
+
+Calculate probability and confidence indicators for potential relationships between cases.
+
+### Map Criminal Networks
+
+Analyse networks to identify:
+
+* Potential leaders
+* Bridge nodes
+* Structural relationships
+* Potential vulnerabilities
+
+### Prioritise Missing-Person Search Areas
+
+Analyse available information to assist in prioritising potential search locations and allocating investigative resources.
+
+### Identify Investigative Gaps in Cold Cases
+
+Compare historical case information with analytical patterns and methods used in subsequently solved or better-developed cases.
+
+### Support Serial-Killer Analysis
+
+Identify potential similarities between cases and produce offender-profile indicators based on available information.
+
+---
+
+# 7. Analytical Outcomes
+
+SICCA generates several categories of analytical outcome.
+
+## 7.1 Probabilistic Scores
+
+Posterior probabilities representing the estimated likelihood of a case linkage based on the evidence currently supplied to the system.
+
+## 7.2 Confidence Levels
+
+Confidence levels adjusted according to:
+
+* Evidence strength
+* Source reliability
+* Time decay
+* Quality of available information
+
+## 7.3 Risk Scores
+
+Logistic risk values designed to assist with investigative prioritisation.
+
+## 7.4 Module-Specific Insights
+
+### Terrorist Networks
+
+Identification of:
+
+* Structural relationships
+* Potential vulnerabilities
+* Network bridges
+* Potentially important nodes
+
+### Missing Persons
+
+Support for:
+
+* Search-area prioritisation
+* Resource allocation
+* Ranking of potential locations
+
+### Cold Cases
+
+Identification of:
+
+* Investigative gaps
+* Potentially applicable methodologies
+* Recommendations for renewed analysis
+
+### Serial Killers
+
+Identification of:
+
+* MO similarities
+* Behavioural indicators
+* Geographic relationships
+* Potential offender-profile characteristics
+
+---
+
+# 8. Reliability of Outcomes
+
+## Strengths
+
+### Bayesian Updating
+
+Bayesian updating provides a structured mechanism for combining multiple evidence signals.
+
+### Exponential Temporal Decay
+
+Exponential decay models the declining relevance of older information and prevents historical events from automatically receiving the same weight as recent events.
+
+### NLP MO Similarity
+
+NLP-based similarity analysis can identify nuanced textual and behavioural overlaps within case descriptions.
+
+## Limitations
+
+### Offline Operation
+
+Because SICCA operates offline, it does not automatically provide live access to:
+
+* GIS systems
+* External intelligence feeds
+* Live databases
+* External information sources
+
+### NLP Methodology
+
+The current NLP implementation uses **TF-IDF**, which is heuristic and less sophisticated than modern deep-learning embedding approaches.
+
+### Input Data Dependency
+
+Reliability depends significantly on the quality of the information entered into the system, including:
+
+* Case descriptions
+* Case links
+* Evidence information
+* Source quality
+* Completeness of the available data
+
+## Overall Assessment
+
+SICCA is intended to be reliable for **pattern detection and investigative prioritisation**, but its outputs should be treated as **decision-support information rather than sole evidence**.
+
+Reliability is expected to be higher when input data is rich, accurate, and well documented, and lower when case descriptions are sparse or incomplete.
+
+---
+
+# 9. Illustrative Test Cases
+
+The following examples illustrate how SICCA can be applied. These are **made-up illustrative cases** and are not presented as real criminal events.
+
+---
+
+## 9.1 Terrorist Network Analysis
+
+### Case A
+
+Bombing in Madrid, 2020.
+
+### Case B
+
+Safe house discovered in Valencia, 2021.
+
+### Case C
+
+Financing operation in Barcelona, 2022.
+
+### SICCA Outcome
+
+Bayesian analysis establishes a strong analytical relationship between Cases A and B based on:
+
+* Temporal overlap
+* Geographic relationship
+
+Network analysis identifies **Case B as a bridge node** connecting Cases A and C.
+
+The analysis identifies the safe house represented by Case B as a potential structural vulnerability within the network.
+
+### Analytical Interpretation
+
+Disrupting the bridge node could potentially have a significant effect on the connectivity of the network.
+
+---
+
+# 10. Missing Person Prediction
+
+### Case D
+
+A missing hiker in Sierra de Guadarrama, last seen in November 2025.
+
+### SICCA Location Predictions
+
+| Location       | Confidence |
+| -------------- | ---------: |
+| Trailhead      |       0.70 |
+| River crossing |       0.60 |
+| Mountain ridge |       0.40 |
+
+### Outcome
+
+Efficiency scoring ranks the **trailhead** as the highest-priority location.
+
+### Recommended Resource Allocation
+
+* 6 units → Trailhead
+* 3 units → River crossing
+* 1 unit → Mountain ridge
+
+The purpose of this prioritisation is to improve resource allocation and potentially increase the efficiency of the search operation.
+
+---
+
+# 11. Cold Case Gap Analysis
+
+### Case E
+
+Unsolved homicide from 1995 in which limited forensic methods were available or used at the time.
+
+SICCA compares the case with similar solved cases from 2005–2015 in which newer investigative technologies were available.
+
+### Identified Investigative Gaps
+
+* Advanced DNA analysis
+* DNA genealogy
+* Digital trace recovery
+* Digital forensics
+
+### Recommendation
+
+Re-examine available evidence using:
+
+* Genetic genealogy where legally and technically appropriate
+* Modern DNA techniques
+* Digital-forensic methodologies
+* Digital trace recovery
+
+### Analytical Confidence
+
+**0.70**, based on the similarity between the historical case and the subsequently solved comparison cases.
+
+---
+
+# 12. Serial-Killer Profiling
+
+### Case F
+
+Victim found in Toledo.
+
+Characteristics:
+
+* Strangulation
+* Body posing
+
+### Case G
+
+Victim found in Ciudad Real.
+
+Characteristics:
+
+* Strangulation
+* Ritualistic staging
+
+### SICCA Analysis
+
+**MO similarity:** 0.85
+
+**Geographic relationship:** Both cases occur within a 100 km radius.
+
+**Signature behaviours:** Posing and ritualistic staging detected.
+
+### Composite Offender Profile Score
+
+**0.92**
+
+This produces a strong analytical indication of a potential serial-offender pattern.
+
+Again, the output represents an analytical indicator and does not independently establish that the cases were committed by the same offender.
+
+---
+
+# 13. Overall SICCA Framework
+
+SICCA provides a **structured, probabilistic, and modular framework for criminal case analysis**.
+
+Its purpose is to enhance investigators' ability to:
+
+* Detect patterns
+* Identify potential relationships
+* Allocate resources
+* Prioritise leads
+* Identify investigative gaps
+* Examine networks
+* Compare cases
+
+SICCA does not replace investigators.
+
+It is designed to enhance human analytical capability by providing structured decision-support information.
+
+### Reliability
+
+Reliability is expected to be:
+
+**High** when input data is rich, accurate, and well structured.
+
+**Moderate** when descriptions and available information are sparse.
+
+The system is therefore best used as a **decision-support tool integrated into the investigative workflow**.
+
+---
+
+# 14. Security & Confidentiality
+
+## Offline Architecture
+
+SICCA's offline architecture means that the core system can operate without an internet connection.
+
+This provides an important security advantage for sensitive investigations because case information does not need to be transmitted to external cloud services for the core analytical workflow.
+
+### Data Containment
+
+Sensitive case data can remain within the organisation's controlled environment.
+
+### Chain of Custody
+
+Evidence and case information can remain within the organisation's own infrastructure and security controls.
+
+### Compliance Considerations
+
+Local operation can make it easier for organisations to implement strict legal and privacy requirements, including requirements relating to:
+
+* GDPR
+* National security procedures
+* Internal data-protection policies
+* Investigative confidentiality
+
+Offline operation does not itself guarantee compliance. Organisations remain responsible for implementing appropriate security, access-control, retention, and legal procedures.
+
+---
+
+# 15. Reliability & Availability
+
+## No Internet Dependency
+
+Investigators can operate SICCA in:
+
+* Remote locations
+* Secure facilities
+* Restricted environments
+* Situations involving network outages
+
+## Local Availability
+
+The system operates locally, meaning availability is primarily dependent on the organisation's own hardware and infrastructure.
+
+## Predictable Performance
+
+Local processing avoids dependency on:
+
+* Internet bandwidth
+* Cloud latency
+* External service availability
+* Cloud-server throttling
+
+---
+
+# 16. Control & Customisation
+
+## Full Ownership
+
+The organisation determines how its:
+
+* Database
+* Backups
+* Maintenance
+* Case-management procedures
+
+are structured and controlled.
+
+## Custom Algorithms
+
+The SICCA analytical framework can be adapted, including:
+
+* Bayesian updating
+* NLP similarity
+* Risk scoring
+
+without depending on external vendor update cycles.
+
+## Integration Freedom
+
+The local architecture can facilitate integration with:
+
+* Forensic tools
+* GIS systems
+* Secure archives
+* Other locally controlled investigative systems
+
+subject to the technical and security requirements of the deployment environment.
+
+---
+
+# 17. Investigator Trust
+
+## Transparency
+
+Analysts can inspect how analytical scores are generated through mechanisms including:
+
+* Bayesian calculations
+* Exponential temporal decay
+* TF-IDF similarity
+
+## No External Cloud Black Box
+
+The offline architecture means the core analytical workflow does not require external cloud AI services.
+
+The analytical process can therefore be examined within the local environment.
+
+## Confidence in Data Provenance
+
+Results are generated from the case information supplied to SICCA rather than automatically combining that information with unknown external sources.
+
+This allows investigators to maintain greater control over the information being analysed.
+
+---
+
+# 18. Practical Example — Terrorist Network Analysis
+
+Imagine an investigation involving a suspected terrorist network.
+
+### Online System
+
+An online system may rely on external services or feeds.
+
+This can create additional considerations regarding:
+
+* Data exposure
+* Network security
+* Third-party infrastructure
+* Confidentiality
+
+### Offline SICCA
+
+SICCA can operate on locally controlled case information.
+
+It can:
+
+1. Apply Bayesian probability analysis.
+2. Examine temporal relationships.
+3. Examine geographic relationships.
+4. Analyse MO similarities.
+5. Map the network.
+6. Identify potential vulnerabilities.
+7. Produce analytical outputs without transmitting the core case data externally.
+
+### Result
+
+Investigators can brief their team using results generated within their controlled environment.
+
+---
+
+# 19. When Online Systems May Be Useful
+
+A balanced comparison is important.
+
+Cloud-based systems can provide advantages including:
+
+* Real-time intelligence feeds
+* Scalable computing resources
+* Processing of extremely large datasets
+* Easier cross-agency collaboration
+
+These capabilities can be valuable in appropriate environments.
+
+However, for highly sensitive investigations, including:
+
+* Terrorism
+* Organised crime
+* Serial homicide
+
+the advantages of offline operation may outweigh the convenience of cloud infrastructure where **security, control, confidentiality, and investigator trust are the primary requirements**.
+
+---
+
+# 20. Offline SICCA vs Online Investigative Systems
+
+| Feature / Factor            | Offline SICCA — Local                                                                                               | Online / Cloud System                                                                                             |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| **Data Security**           | Local/air-gapped operation can minimise network exposure. Sensitive data remains within the controlled environment. | Network-connected infrastructure can introduce additional exposure to breaches or unauthorised access.            |
+| **Confidentiality**         | Organisation maintains direct control over data storage and handling.                                               | Data may be stored or processed on third-party infrastructure.                                                    |
+| **Reliability**             | Can operate without internet connectivity, including in secure or remote environments.                              | Dependent on internet connectivity and cloud-service availability.                                                |
+| **Performance**             | Local processing provides predictable performance without internet latency or bandwidth limitations.                | Performance may be affected by network conditions, service availability, or throttling.                           |
+| **Control & Customisation** | Organisation controls database structure, algorithms, workflows, and maintenance.                                   | Customisation may be constrained by the service provider.                                                         |
+| **Transparency**            | Analytical components such as Bayesian scoring, exponential decay, and NLP methods can be inspected.                | Some cloud AI systems may provide less visibility into their underlying models.                                   |
+| **Investigator Trust**      | Results can be generated exclusively from locally supplied data.                                                    | External services may introduce additional data sources or processing outside the investigator's environment.     |
+| **Scalability**             | Limited by local hardware capacity.                                                                                 | Cloud infrastructure can scale to very large datasets.                                                            |
+| **Collaboration**           | Role-based permissions can support controlled collaboration within the secure environment.                          | Cross-agency collaboration can be easier, although additional security considerations apply.                      |
+| **Best Use Case**           | High-sensitivity investigations where confidentiality and local control are priorities.                             | Large-scale analytics, broad intelligence sharing, and environments where scalability is the primary requirement. |
+
+### Summary
+
+Offline SICCA is particularly suited to environments where:
+
+* Confidentiality is critical
+* Reliability is required without internet access
+* Investigators need direct control
+* Analytical transparency is important
+
+Online systems remain useful where:
+
+* Scalability is essential
+* Real-time external intelligence is required
+* Large-scale collaboration is necessary
+
+For high-sensitivity investigations such as terrorism, organised crime, and serial-homicide analysis, an offline architecture can provide significant advantages where security and control are more important than convenience.
+
+---
+
+# 21. Cross-Match Probability
+
+## How High Scores Emerge — and How to Use Them
+
+Cross-match probability analysis examines how SICCA can assign a high analytical score to a person, case, location, or pattern that has not previously been identified as a formal suspect or established relationship.
+
+The objective is to identify potentially meaningful intersections across:
+
+* Time
+* Geography
+* Behaviour
+* Modus operandi
+* Case narratives
+
+This section examines the process across three contexts:
+
+* Terrorism
+* Serial homicide
+* Missing persons
+
+A high score is an **analytical signal**, not a conclusion of guilt.
+
+---
+
+# 22. Probability Engine Overview
+
+## 22.1 Bayesian Core
+
+SICCA begins with a prior probability and updates it using evidence represented through likelihood ratios.
+
+### Prior Odds
+
+$$
+O_{\text{prior}} =
+\frac{P_{\text{prior}}}{1-P_{\text{prior}}}
+$$
+
+### Posterior Odds
+
+$$
+O_{\text{post}}
+=
+O_{\text{prior}}
+\times
+\prod_i LR_i
+$$
+
+### Posterior Probability
+
+$$
+P_{\text{post}}
+=
+\frac{O_{\text{post}}}
+{1+O_{\text{post}}}
+$$
+
+---
+
+# 23. Evidence Signals
+
+SICCA converts several evidence signals into likelihood ratios.
+
+These include:
+
+* Temporal proximity
+* Geographic proximity
+* MO/behavioural similarity
+
+The current mapping uses:
+
+$$
+LR(s)=
+\frac{\varepsilon+s}
+{\varepsilon+(1-s)}
+$$
+
+where:
+
+* \(s \in [0,1]\) is the signal score
+* \(\varepsilon\) is a stabilising factor
+
+---
+
+# 24. Confidence Layering
+
+Posterior probability is tempered by factors including:
+
+* Exponential time decay
+* Source reliability
+* Evidence reliability
+
+The confidence calculation is represented as:
+
+$$
+C =
+P_{\text{post}}
+\times
+e^{-\lambda t}
+\times
+f_{\text{source}}
+\times
+f_{\text{evidence}}
+$$
+
+This provides a distinction between:
+
+**How strong the analytical linkage appears**
+
+and
+
+**How much confidence should be placed in that linkage.**
+
+---
+
+# 25. Risk Mapping
+
+SICCA maps combined signals into an operational risk score using a logistic function:
+
+$$
+R =
+\frac{1}
+{1+e^{-(\alpha P_{\text{post}}
++\beta C
++\gamma E)}}
+$$
+
+The risk score is intended to support **operational prioritisation**, not to establish guilt.
+
+---
+
+# 26. Evidence Signals That Can Move a Non-Suspect to a Higher Score
+
+## 26.1 Temporal Proximity
+
+Recent and clustered events increase the temporal signal.
+
+The mechanism is:
+
+$$
+s_{\text{temp}}
+=
+e^{-\lambda_{\text{temp}}\Delta t}
+$$
+
+The closer events are in time, the stronger the temporal relationship may become.
+
+---
+
+## 26.2 Geographic Proximity
+
+Repeated presence, shared locations, or feasible travel corridors can increase the geographic signal.
+
+SICCA's current offline implementation uses:
+
+* Anchor locations
+* Distance heuristics
+* Soft geographic bonuses
+
+It does not depend on live GIS data.
+
+---
+
+## 26.3 MO / Behavioural Similarity
+
+Offline NLP compares case narratives using TF-IDF.
+
+The system examines textual overlap involving:
+
+* Modus operandi
+* Scene characteristics
+* Behavioural descriptions
+* Relevant keywords
+
+Similarity is calculated using the cosine similarity between TF-IDF vectors.
+
+---
+
+# 27. How High Posterior Probability Can Arise
+
+High posterior probability can occur when several independent signals align consistently.
+
+Each signal can generate a likelihood ratio above 1.
+
+When these likelihood ratios are multiplied together, the combined odds can increase significantly.
+
+Therefore, even where a person or entity was not previously flagged, consistent intersections across:
+
+* Time
+* Space
+* Behaviour
+
+can cause SICCA to surface that entity for investigative review.
+
+The important principle is:
+
+**The strength comes from convergence of signals rather than reliance on a single indicator.**
+
+---
+
+# 28. Interpreting a High Cross-Match Score
+
+## Posterior Probability — \(P_{\text{post}}\)
+
+Indicates the estimated likelihood that the candidate is linked to the relevant case set given the current evidence.
+
+**It is not a probability of guilt.**
+
+It represents **linkage likelihood** within the model.
+
+## Confidence — \(C\)
+
+Provides a reliability-adjusted view of the posterior probability.
+
+For example:
+
+A high \(P_{\text{post}}\) combined with a low \(C\) indicates that factors such as weak sources or temporal decay may reduce confidence in the apparent relationship.
+
+## Risk — \(R\)
+
+Provides an operational prioritisation measure.
+
+A high risk score should elevate a candidate or pattern for **triage and review**, not produce an automatic conclusion.
+
+---
+
+# 29. Investigative Thresholds
+
+The current SICCA framework defines the following illustrative thresholds.
+
+## Screening Threshold
+
+When:
+
+$$
+P_{\text{post}}\geq0.65
+$$
+
+and
+
+$$
+C\geq0.55
+$$
+
+the candidate moves to:
+
+**Investigative Review**
+
+## Action Threshold
+
+When:
+
+$$
+P_{\text{post}}\geq0.80
+$$
+
+and
+
+$$
+C\geq0.65
+$$
+
+the candidate can be considered for:
+
+* Targeted record checks
+* Alibi verification
+* Geofence review
+* Other lawful investigative checks
+
+These thresholds should be regarded as **methodological parameters subject to validation**, rather than universal investigative standards.
+
+---
+
+# 30. False Positives vs Stability
+
+A single strong signal can cause an analytical score to increase sharply.
+
+For that reason, SICCA should favour:
+
+* Multi-signal convergence
+* Repeated corroboration
+* Stability across updated datasets
+* Independent confirmation
+
+rather than treating a single high-scoring signal as sufficient.
+
+The objective is to reduce spurious hits and improve the stability of analytical results.
+
+---
+
+# 31. Worked Example — Terrorist Cross-Match
+
+## Scenario
+
+A previously unidentified operative is evaluated against several incidents.
+
+### Signals
+
+**Temporal**
+
+Three incidents occur within seven months.
+
+$$
+s_{\text{temp}}\approx0.50
+$$
+
+**Geographic**
+
+Presence across Madrid and Valencia anchor locations.
+
+$$
+s_{\text{geo}}=0.70
+$$
+
+**MO / NLP**
+
+Overlap involving:
+
+* Safe house
+* Explosive precursor
+* Courier
+
+$$
+s_{\text{mo}}=0.75
+$$
+
+---
+
+## Likelihood Ratios
+
+Using:
+
+$$
+LR(s)=
+\frac{0.05+s}
+{0.05+(1-s)}
+$$
+
+the illustrative values are:
+
+$$
+LR_{\text{temp}}
+\approx1.00
+$$
+
+$$
+LR_{\text{geo}}
+\approx1.75
+$$
+
+$$
+LR_{\text{mo}}
+\approx2.67
+$$
+
+---
+
+## Bayesian Update
+
+Starting prior:
+
+$$
+P_0=0.12
+$$
+
+Prior odds:
+
+$$
+O_0=
+\frac{0.12}{0.88}
+\approx0.136
+$$
+
+Posterior odds:
+
+$$
+O_{\text{post}}
+=
+0.136
+\times1.00
+\times1.75
+\times2.67
+\approx0.635
+$$
+
+Posterior probability:
+
+$$
+P_{\text{post}}
+=
+\frac{0.635}{1+0.635}
+\approx0.388
+$$
+
+### Confidence
+
+Assuming:
+
+* Strong sources
+* Recent events
+* \(t=1\) year
+* \(\lambda=0.08\)
+* Evidence factor \(E=0.65\)
+
+then:
+
+$$
+C
+\approx
+0.388
+\times
+e^{-0.08}
+\times
+0.9
+\times
+0.65
+\approx0.21
+$$
+
+### Interpretation
+
+The posterior probability is moderate, but confidence is comparatively modest.
+
+The appropriate response is therefore **targeted verification**, such as:
+
+* Travel-log examination
+* Associate analysis
+* Other lawful verification procedures
+
+rather than immediate escalation.
+
+If additional MO evidence increases:
+
+$$
+s_{\text{mo}}\rightarrow0.85
+$$
+
+the posterior probability can increase significantly.
+
+---
+
+# 32. Worked Example — Serial-Killer Cross-Match
+
+## Scenario
+
+Two homicides are examined for a potential emerging pattern.
+
+### Signals
+
+**Temporal**
+
+Two homicides occur five weeks apart.
+
+$$
+s_{\text{temp}}\approx0.67
+$$
+
+**Geographic**
+
+Cases fall within a 40–90 km corridor consistent with a journey-to-crime relationship.
+
+$$
+s_{\text{geo}}=0.65
+$$
+
+**MO / NLP**
+
+Overlap includes:
+
+* Strangulation
+* Posing
+* Dump-site staging
+
+$$
+s_{\text{mo}}=0.82
+$$
+
+---
+
+## Likelihood Ratios
+
+$$
+LR_{\text{temp}}\approx1.86
+$$
+
+$$
+LR_{\text{geo}}\approx1.67
+$$
+
+$$
+LR_{\text{mo}}\approx3.25
+$$
+
+---
+
+## Bayesian Update
+
+Using:
+
+$$
+O_0=0.136
+$$
+
+the posterior odds are:
+
+$$
+O_{\text{post}}
+=
+0.136
+\times1.86
+\times1.67
+\times3.25
+\approx1.37
+$$
+
+Therefore:
+
+$$
+P_{\text{post}}
+=
+\frac{1.37}{1+1.37}
+\approx0.58
+$$
+
+### Confidence
+
+Using:
+
+* Recent events
+* Reliable sources
+* \(t=0.1\) year
+
+the illustrative confidence becomes:
+
+$$
+C
+\approx
+0.58
+\times
+e^{-0.008}
+\times
+0.9
+\times
+0.75
+\approx0.35
+$$
+
+### Interpretation
+
+The combination of MO similarity and geographic corridor produces a substantially stronger linkage signal.
+
+Potential next investigative steps include:
+
+* Victimology clustering
+* Vehicle checks within the relevant corridor
+* Examination of dump-site access and egress points
+* Additional case comparison
+
+These remain investigative leads requiring independent verification.
+
+---
+
+# 33. Worked Example — Missing Person Cross-Match
+
+## Scenario
+
+A person of interest is evaluated in relation to a disappearance.
+
+### Signals
+
+**Temporal**
+
+The disappearance occurs during the same weekend as the candidate's known presence.
+
+$$
+s_{\text{temp}}=0.60
+$$
+
+**Geographic**
+
+The candidate's phone is recorded near the trailhead.
+
+$$
+s_{\text{geo}}=0.75
+$$
+
+**Behavioural / Narrative**
+
+TF-IDF similarity is identified between case narratives and witness descriptions involving:
+
+* Giving a ride
+* Late-night activity
+* River crossing
+
+$$
+s_{\text{mo}}=0.70
+$$
+
+---
+
+## Likelihood Ratios
+
+$$
+LR_{\text{temp}}\approx1.50
+$$
+
+$$
+LR_{\text{geo}}\approx2.38
+$$
+
+$$
+LR_{\text{mo}}\approx2.33
+$$
+
+---
+
+## Bayesian Update
+
+Starting with:
+
+$$
+O_0=0.136
+$$
+
+the posterior odds are:
+
+$$
+O_{\text{post}}
+=
+0.136
+\times1.50
+\times2.38
+\times2.33
+\approx1.12
+$$
+
+Therefore:
+
+$$
+P_{\text{post}}
+\approx0.53
+$$
+
+### Confidence
+
+With:
+
+* Mixed-quality data
+* \(f_{\text{source}}=0.75\)
+* Evidence factor \(E=0.60\)
+* \(t=0.5\) year
+
+the illustrative confidence is:
+
+$$
+C
+\approx
+0.53
+\times
+e^{-0.04}
+\times
+0.75
+\times
+0.60
+\approx0.23
+$$
+
+### Interpretation
+
+The result indicates a meaningful probability of linkage, but confidence remains cautious.
+
+Potential next steps include:
+
+* Interview scheduling
+* Route reconstruction
+* Resource prioritisation around the trailhead
+* Verification of the candidate's movements
+
+---
+
+# 34. Reliability, Safeguards & Escalation
+
+## Reliability Drivers
+
+### Multi-Signal Convergence
+
+Temporal, geographic, and MO alignment is generally more informative than any one signal alone.
+
+### Recency
+
+Exponential decay prevents older coincidences from automatically receiving excessive weight.
+
+### Text Richness
+
+Detailed case narratives provide more information for TF-IDF comparison and can improve discrimination between similar and unrelated cases.
+
+---
+
+# 35. Safeguards Against False Positives
+
+## Minimum Corroboration Rule
+
+Require at least **two independent signals above 0.65** before moving beyond the initial screening stage.
+
+## Stability Checks
+
+Recalculate the result using an updated corpus to determine whether the score persists.
+
+## Audit Trail
+
+Record:
+
+* Signals
+* Likelihood ratios
+* Updates
+* Changes in scores
+
+This allows reviewers to trace why an analytical score increased or decreased.
+
+---
+
+# 36. Escalation Protocol for High-Scoring Non-Suspects
+
+A high score should trigger **structured verification**, not an automatic conclusion.
+
+## Tier 1 — Verification
+
+Verify:
+
+* Identity
+* Timeline
+* Presence
+* Plausible benign explanations
+
+## Tier 2 — Context
+
+Examine, where lawful and appropriate:
+
+* Associates
+* Communications
+* Vehicle/travel feasibility
+* Proximity to relevant scenes
+
+## Tier 3 — Directed Inquiries
+
+Potential actions may include:
+
+* Interviews
+* Targeted records checks
+* Surveillance
+
+All such activity must be legally authorised and conducted according to applicable investigative procedures.
+
+## Tier 4 — Reassessment
+
+New information should be entered into SICCA.
+
+The system should then recalculate:
+
+$$
+P_{\text{post}}
+$$
+
+and
+
+$$
+C
+$$
+
+If the underlying signals weaken, the candidate should be **de-escalated** accordingly.
+
+---
+
+# 37. Practical Takeaways
+
+## High Probability Does Not Mean Guilt
+
+A high probability indicates **linkage likelihood within the analytical model**.
+
+It prioritises attention; it does not establish guilt.
+
+## Chase Convergence, Not Spikes
+
+A candidate who repeatedly intersects with cases across:
+
+* Time
+* Geography
+* Behaviour
+
+deserves greater analytical attention than a candidate identified through a single isolated signal.
+
+## Use Confidence as a Brake
+
+If confidence is significantly lower than the posterior probability, additional and better-quality information should be gathered before significant investigative escalation.
+
+## Document Decisions
+
+Audit logs and defined thresholds help create a consistent and defensible analytical process.
+
+---
+
+# 38. SICCA System Architecture
+
+The complete SICCA workflow can be represented as follows:
+
+```text
+┌──────────────────────────────────────┐
+│              USER INPUT              │
+│                                      │
+│  • Create Case                       │
+│  • Upload CSV                        │
+│  • Link Cases                        │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────┐
+│            CASE DATABASE             │
+│                                      │
+│  • Cases & Links                     │
+│  • Users & Roles                     │
+│  • Analysis Tables                   │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────────────┐
+│                ANALYSIS ENGINE                  │
+│                                                 │
+│  Bayesian Probability Updating                  │
+│  • Temporal — exponential decay                 │
+│  • Geographic — distance heuristic              │
+│  • MO Similarity — offline NLP / TF-IDF         │
+│                                                 │
+│  Specialized Modules:                           │
+│  • Terrorist Network Analysis                   │
+│  • Missing Person Prediction                    │
+│  • Cold Case Gap Analysis                       │
+│  • Serial Killer Profiling                      │
+└──────────────────────┬──────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────┐
+│              OUTCOMES                │
+│                                      │
+│  • Posterior Probabilities           │
+│  • Confidence Scores                 │
+│  • Risk Assessments                  │
+│  • Module-Specific Insights          │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────┐
+│          OUTPUTS & REPORTS           │
+│                                      │
+│  • Dashboard Summaries               │
+│  • CSV Exports                       │
+│  • Audit Logs                        │
+└──────────────────────────────────────┘
+```
+
+---
+
+# 39. Final SICCA Position
+
+SICCA is designed as a **structured, probabilistic, modular, and locally controlled investigative intelligence platform**.
+
+Its analytical framework combines:
+
+**Case Management**
+
+*
+
+**Bayesian Probability Updating**
+
+*
+
+**Temporal Decay**
+
+*
+
+**Geographic Analysis**
+
+*
+
+**Offline NLP / TF-IDF MO Similarity**
+
+*
+
+**Risk Assessment**
+
+*
+
+**Confidence Scoring**
+
+*
+
+**Specialised Investigative Modules**
+
+*
+
+**Auditability**
+
+The system's purpose is to help investigators identify patterns, examine potential case relationships, prioritise resources, identify investigative gaps, and structure complex information.
+
+The central principle remains:
+
+> **SICCA does not replace the investigator. It gives the investigator a structured analytical framework with which to examine complex case information.**
+
+The quality of SICCA's conclusions ultimately depends on the quality of the underlying data, the validity of its analytical assumptions, the suitability of its models, and the professional judgment applied to its outputs.
+
 
