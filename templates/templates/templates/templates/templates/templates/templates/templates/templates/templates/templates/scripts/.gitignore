@@ -15,10 +15,9 @@ venv/
 env/
 .pytest_cache/
 
-# Exports
+# Exports and archives
 exports/
-SICCA_v2_report.pdf
-SICCA_v2_report.html
+sicca-complete-*.zip
 
 # Editor
 .vscode/
