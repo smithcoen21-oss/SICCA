@@ -1,0 +1,106 @@
+templates/calibration_trace.html
+
+{% extends "_fallback_base.html" %}
+{% block body %}
+<h1>Case trace — {{ case.case_id }}</h1>
+<p><strong>{{ case.case_name }}</strong></p>
+
+<p><a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a>
+  &nbsp;|&nbsp;
+  <a href="{{ url_for('analyze_case', case_id=case.case_id) }}">Full analysis</a>
+</p>
+
+<h2>Inputs</h2>
+<table>
+  <tr><th>Type</th><td>{{ trace.input.type }}</td></tr>
+  <tr><th>Evidence count</th><td>{{ trace.input.evidence_count }}</td></tr>
+  <tr><th>Suspects count</th><td>{{ trace.input.suspects_count }}</td></tr>
+  <tr><th>Status</th><td>{{ trace.input.status }}</td></tr>
+  <tr><th>Priority</th><td>{{ trace.input.priority }}</td></tr>
+  <tr><th>Year</th><td>{{ trace.input.year }}</td></tr>
+  <tr><th>Stated confidence</th><td>{{ "%.3f"|format(trace.input.confidence) }}</td></tr>
+</table>
+
+<h2>Configuration used</h2>
+<table>
+  <tr><th>Base prior</th><td>{{ trace.configuration.base_prior }}</td></tr>
+  <tr><th>Age decay lambda</th><td>{{ trace.configuration.age_decay_lambda }}</td></tr>
+  <tr><th>Evidence LR clamp</th>
+      <td>{{ trace.configuration.min_feature_lr }} – {{ trace.configuration.max_feature_lr }}</td></tr>
+  <tr><th>High threshold</th><td>{{ trace.configuration.high_threshold }}</td></tr>
+  <tr><th>Medium threshold</th><td>{{ trace.configuration.medium_threshold }}</td></tr>
+</table>
+
+<h2>Step 1 — type likelihood ratio</h2>
+<table>
+  <tr><th>type_lr</th><td>{{ trace.step_type_lr.type_lr }}</td></tr>
+  <tr><th>note</th><td>{{ trace.step_type_lr.note }}</td></tr>
+</table>
+
+<h2>Step 2 — evidence likelihood ratio</h2>
+<p>The evidence LR is the product of four factors. Each is shown so the arithmetic can be checked by hand.</p>
+<table>
+  <tr><th>Evidence component</th>
+      <td>1 + 0.35 × ln(1 + {{ trace.input.evidence_count }}) = {{ trace.step_evidence_lr.evidence_component }}</td></tr>
+  <tr><th>Suspects component</th>
+      <td>1 + 0.10 × max(0, {{ trace.input.suspects_count }} − 1) = {{ trace.step_evidence_lr.suspects_component }}</td></tr>
+  <tr><th>Status component</th>
+      <td>{{ trace.input.status }} → {{ trace.step_evidence_lr.status_component }}</td></tr>
+  <tr><th>Priority component</th>
+      <td>{{ trace.input.priority }} → {{ trace.step_evidence_lr.priority_component }}</td></tr>
+  <tr><th>Raw product</th>
+      <td>{{ trace.step_evidence_lr.raw_product }}</td></tr>
+  <tr><th>After clamping</th>
+      <td>{{ trace.step_evidence_lr.clamped }}
+        {% if trace.step_evidence_lr.clamped_hit != 'none' %}
+          (clamped at {{ trace.step_evidence_lr.clamped_hit }})
+        {% endif %}
+      </td></tr>
+</table>
+
+<h2>Step 3 — Bayes update</h2>
+<table>
+  <tr><th>Prior probability</th><td>{{ trace.step_bayes.prior_probability }}</td></tr>
+  <tr><th>Prior odds</th>
+      <td>{{ trace.step_bayes.prior_probability }} / (1 − {{ trace.step_bayes.prior_probability }})
+          = {{ trace.step_bayes.prior_odds }}</td></tr>
+  <tr><th>Posterior odds</th>
+      <td>{{ trace.step_bayes.prior_odds }} × {{ trace.step_type_lr.type_lr }}
+          × {{ trace.step_evidence_lr.clamped }}
+          = {{ trace.step_bayes.posterior_odds }}</td></tr>
+  <tr><th>Posterior probability</th>
+      <td>{{ trace.step_bayes.posterior_odds }} / (1 + {{ trace.step_bayes.posterior_odds }})
+          = <strong>{{ trace.step_bayes.posterior_probability }}</strong></td></tr>
+</table>
+
+<h2>Step 4 — age decay</h2>
+<table>
+  <tr><th>Case age (years)</th><td>{{ trace.step_decay.case_age_years }}</td></tr>
+  <tr><th>Decay factor</th>
+      <td>exp(−{{ trace.configuration.age_decay_lambda }}
+          × {{ trace.step_decay.case_age_years }})
+          = {{ trace.step_decay.decay_factor }}</td></tr>
+  <tr><th>Base confidence</th><td>{{ trace.step_decay.base_confidence }}</td></tr>
+  <tr><th>Decayed confidence</th>
+      <td>{{ trace.step_decay.base_confidence }} × {{ trace.step_decay.decay_factor }}
+          = {{ trace.step_decay.decayed_confidence }}</td></tr>
+  <tr><th>Multiplier</th>
+      <td>0.5 + 0.5 × {{ trace.step_decay.decayed_confidence }}
+          = {{ trace.step_decay.multiplier }}</td></tr>
+</table>
+
+<h2>Result</h2>
+<table>
+  <tr><th>Posterior</th><td>{{ trace.result.posterior }}</td></tr>
+  <tr><th>Adjusted posterior</th>
+      <td>{{ trace.result.posterior }} × {{ trace.step_decay.multiplier }}
+          = <strong>{{ trace.result.adjusted_posterior }}</strong></td></tr>
+  <tr><th>Band</th><td><strong>{{ trace.result.band }}</strong></td></tr>
+</table>
+
+<p style="margin-top:2rem">
+  Every number above is reproducible by hand from the inputs and the
+  configuration. If any value differs from what you compute, the code and
+  this page have diverged — report it.
+</p>
+{% endblock %}
