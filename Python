@@ -1,27 +1,778 @@
+bash
+python install_sicca.py /path/to/target-directory
+
+
+#!/usr/bin/env python3
+"""
+SICCA installer.
+
+Writes the complete project tree -- application, calibration module,
+templates, and helper scripts -- to a target directory. Every file is
+embedded in this script, so it needs no network access and no source
+tree to run.
+
+Assemble this file from two parts (they were delivered separately).
+After assembly, run:
+
+    python install_sicca.py [target-directory]
+
+Default target is ./sicca_build. The installer refuses to overwrite
+files unless --force is passed.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+# =============================================================================
+# EMBEDDED FILES
+# -----------------------------------------------------------------------------
+# Each entry is (relative_path, text_content).
+# =============================================================================
+
+FILES: list[tuple[str, str]] = []
+
+
+def add(path: str, content: str) -> None:
+    """Register an embedded file. Leading newline is stripped so the
+    source stays readable in this script."""
+    FILES.append((path, content.lstrip("\n")))
+
+
+# -----------------------------------------------------------------------------
+# requirements.txt
+# -----------------------------------------------------------------------------
+add("requirements.txt", r"""
+Flask>=3.0
+Flask-Login>=0.6
+Flask-WTF>=1.2
+scikit-learn>=1.4
+pandas>=2.2
+numpy>=1.26
+joblib>=1.3
+matplotlib>=3.8
+""")
+
+
+# -----------------------------------------------------------------------------
+# sicca_calibration.py
+# -----------------------------------------------------------------------------
+add("sicca_calibration.py", r'''
+# =============================================================================
+# SICCA CALIBRATION MODULE
+# -----------------------------------------------------------------------------
+# Pure functions that expose the arithmetic of the Bayesian layer.
+#
+# Nothing in this module touches Flask, the database, or the filesystem.
+# Everything is passed in as an argument, so the module can be unit-tested
+# in isolation and cannot read data it was not given.
+# =============================================================================
+
+from __future__ import annotations
+
+from math import exp, isfinite, log1p
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
+
+
+def odds(p: float) -> float:
+    p = min(max(float(p), 1e-6), 1 - 1e-6)
+    return p / (1 - p)
+
+
+def prob(o: float) -> float:
+    return float(o) / (1.0 + float(o))
+
+
+def safe_float(value: Any, default: float) -> float:
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return default
+    return x if isfinite(x) else default
+
+
+def trace_case(
+    case: Mapping[str, Any],
+    *,
+    base_prior: float,
+    type_lr_map: Mapping[str, float],
+    status_lr_map: Mapping[str, float],
+    priority_lr_map: Mapping[str, float],
+    age_decay_lambda: float,
+    min_feature_lr: float,
+    max_feature_lr: float,
+    high_threshold: float,
+    medium_threshold: float,
+    current_year: int,
+) -> Dict[str, Any]:
+    ctype = str(case.get("type", "unknown")).lower()
+    type_lr = float(type_lr_map.get(ctype, 1.0))
+
+    ev_count = int(safe_float(case.get("evidence_count", 0), 0))
+    su_count = int(safe_float(case.get("suspects_count", 0), 0))
+    status = str(case.get("status", "unknown")).lower()
+    priority = str(case.get("priority", "medium")).lower()
+
+    ev_component = 1.0 + 0.35 * log1p(max(0, ev_count))
+    su_component = 1.0 + 0.10 * max(0, su_count - 1)
+    st_component = float(status_lr_map.get(status, 1.0))
+    pr_component = float(priority_lr_map.get(priority, 1.0))
+    ev_lr_raw = ev_component * su_component * st_component * pr_component
+    ev_lr = max(min_feature_lr, min(max_feature_lr, ev_lr_raw))
+
+    prior_odds = odds(base_prior)
+    posterior_odds = prior_odds * type_lr * ev_lr
+    posterior = prob(posterior_odds)
+
+    year = int(safe_float(case.get("year", current_year), current_year))
+    age = max(0, current_year - year)
+    base_conf = safe_float(case.get("confidence", 0.5), 0.5)
+    base_conf = max(0.0, min(1.0, base_conf))
+    decay_factor = exp(-age_decay_lambda * age)
+    decayed_conf = max(0.0, min(1.0, base_conf * decay_factor))
+    multiplier = 0.5 + 0.5 * decayed_conf
+    adjusted = posterior * multiplier
+
+    band = (
+        "high" if adjusted > high_threshold
+        else "medium" if adjusted > medium_threshold
+        else "low"
+    )
+
+    return {
+        "input": {
+            "type": ctype,
+            "evidence_count": ev_count,
+            "suspects_count": su_count,
+            "status": status,
+            "priority": priority,
+            "year": year,
+            "confidence": base_conf,
+        },
+        "configuration": {
+            "base_prior": float(base_prior),
+            "age_decay_lambda": float(age_decay_lambda),
+            "min_feature_lr": float(min_feature_lr),
+            "max_feature_lr": float(max_feature_lr),
+            "high_threshold": float(high_threshold),
+            "medium_threshold": float(medium_threshold),
+        },
+        "step_type_lr": {
+            "type_lr": type_lr,
+            "note": "likelihood ratio for the crime type",
+        },
+        "step_evidence_lr": {
+            "evidence_component": round(ev_component, 6),
+            "suspects_component": round(su_component, 6),
+            "status_component": round(st_component, 6),
+            "priority_component": round(pr_component, 6),
+            "raw_product": round(ev_lr_raw, 6),
+            "clamped": round(ev_lr, 6),
+            "clamped_hit": "none"
+                if abs(ev_lr_raw - ev_lr) < 1e-9
+                else ("min" if ev_lr_raw < ev_lr else "max"),
+        },
+        "step_bayes": {
+            "prior_probability": round(float(base_prior), 6),
+            "prior_odds": round(prior_odds, 6),
+            "posterior_odds": round(posterior_odds, 6),
+            "posterior_probability": round(posterior, 6),
+        },
+        "step_decay": {
+            "case_age_years": age,
+            "base_confidence": round(base_conf, 6),
+            "decay_factor": round(decay_factor, 6),
+            "decayed_confidence": round(decayed_conf, 6),
+            "multiplier": round(multiplier, 6),
+        },
+        "result": {
+            "posterior": round(posterior, 6),
+            "adjusted_posterior": round(adjusted, 6),
+            "band": band,
+        },
+    }
+
+
+def decay_curve(
+    *,
+    posterior: float,
+    confidence: float,
+    ages: Sequence[int],
+    age_decay_lambda: float,
+) -> List[Dict[str, float]]:
+    out: List[Dict[str, float]] = []
+    for age in ages:
+        age = int(age)
+        decayed = max(0.0, min(1.0, float(confidence)
+                                * exp(-age_decay_lambda * age)))
+        adjusted = float(posterior) * (0.5 + 0.5 * decayed)
+        out.append({
+            "age": float(age),
+            "decayed_confidence": round(decayed, 6),
+            "adjusted": round(adjusted, 6),
+        })
+    return out
+
+
+def decay_curve_png(
+    *,
+    curves: Mapping[str, Mapping[str, Any]],
+    high_threshold: float,
+    medium_threshold: float,
+    title: str,
+    path: str,
+    max_age: int = 60,
+) -> str:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        raise RuntimeError(f"matplotlib unavailable: {exc}") from exc
+
+    ages = list(range(0, max_age + 1))
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for label, cfg in curves.items():
+        points = decay_curve(
+            posterior=float(cfg["posterior"]),
+            confidence=float(cfg["confidence"]),
+            ages=ages,
+            age_decay_lambda=float(cfg.get("age_decay_lambda", 0.05)),
+        )
+        ax.plot([p["age"] for p in points],
+                [p["adjusted"] for p in points],
+                linewidth=2, label=label)
+
+    ax.axhline(high_threshold, color="#ef4444", linestyle="--",
+               linewidth=1.2, label=f"high threshold ({high_threshold})")
+    ax.axhline(medium_threshold, color="#f59e0b", linestyle="--",
+               linewidth=1.2, label=f"medium threshold ({medium_threshold})")
+
+    ax.set_xlabel("Case age (years)")
+    ax.set_ylabel("Adjusted posterior")
+    ax.set_title(title)
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.25)
+    ax.legend(loc="upper right", fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
+def band_for(score: float, high: float, medium: float) -> str:
+    return "high" if score > high else "medium" if score > medium else "low"
+
+
+def sensitivity_grid(
+    cases: Iterable[Mapping[str, Any]],
+    *,
+    priors: Sequence[float],
+    type_lrs: Sequence[float],
+    target_type: str,
+    status_lr_map: Mapping[str, float],
+    priority_lr_map: Mapping[str, float],
+    age_decay_lambda: float,
+    min_feature_lr: float,
+    max_feature_lr: float,
+    high_threshold: float,
+    medium_threshold: float,
+    current_year: int,
+    cap: int = 200,
+) -> Dict[str, Any]:
+    cases = list(cases)[:cap]
+    target_type = target_type.lower()
+
+    out_cases = []
+    for case in cases:
+        ctype = str(case.get("type", "unknown")).lower()
+        if ctype != target_type:
+            continue
+        trace = trace_case(
+            case,
+            base_prior=0.5,
+            type_lr_map={target_type: 1.0},
+            status_lr_map=status_lr_map,
+            priority_lr_map=priority_lr_map,
+            age_decay_lambda=age_decay_lambda,
+            min_feature_lr=min_feature_lr,
+            max_feature_lr=max_feature_lr,
+            high_threshold=high_threshold,
+            medium_threshold=medium_threshold,
+            current_year=current_year,
+        )
+        out_cases.append({
+            "case_id": case.get("case_id"),
+            "case_name": case.get("case_name"),
+            "year": case.get("year"),
+            "evidence_lr": trace["step_evidence_lr"]["clamped"],
+            "decay_multiplier": trace["step_decay"]["multiplier"],
+        })
+
+    grid = []
+    for prior in priors:
+        for tl in type_lrs:
+            bands: Dict[str, str] = {}
+            scores: Dict[str, float] = {}
+            for c in out_cases:
+                posterior = prob(odds(prior) * tl * c["evidence_lr"])
+                adjusted = posterior * c["decay_multiplier"]
+                scores[c["case_id"]] = round(adjusted, 6)
+                bands[c["case_id"]] = band_for(adjusted,
+                                               high_threshold, medium_threshold)
+            grid.append({
+                "prior": float(prior),
+                "type_lr": float(tl),
+                "scores": scores,
+                "bands": bands,
+            })
+
+    return {
+        "target_type": target_type,
+        "current_year": int(current_year),
+        "cases": out_cases,
+        "priors": [float(p) for p in priors],
+        "type_lrs": [float(t) for t in type_lrs],
+        "grid": grid,
+        "cap": cap,
+        "cases_seen": len(out_cases),
+        "high_threshold": float(high_threshold),
+        "medium_threshold": float(medium_threshold),
+    }
+
+
+def trace_summary(trace: Mapping[str, Any]) -> str:
+    r = trace["result"]
+    b = trace["step_bayes"]
+    d = trace["step_decay"]
+    return (
+        f"prior={b['prior_probability']:.2f} "
+        f"-> odds={b['prior_odds']:.3f} "
+        f"-> posterior={r['posterior']:.3f} "
+        f"-> decay(x{d['multiplier']:.2f}) "
+        f"-> adjusted={r['adjusted_posterior']:.3f} "
+        f"[{r['band']}]"
+    )
+''')
+#!/usr/bin/env python3
+"""
+SICCA installer.
+
+Writes the complete project tree -- application, calibration module,
+templates, and helper scripts -- to a target directory. Every file is
+embedded in this script, so it needs no network access and no source
+tree to run.
+
+Assemble this file from two parts (they were delivered separately).
+After assembly, run:
+
+    python install_sicca.py [target-directory]
+
+Default target is ./sicca_build. The installer refuses to overwrite
+files unless --force is passed.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+# =============================================================================
+# EMBEDDED FILES
+# -----------------------------------------------------------------------------
+# Each entry is (relative_path, text_content).
+# =============================================================================
+
+FILES: list[tuple[str, str]] = []
+
+
+def add(path: str, content: str) -> None:
+    """Register an embedded file. Leading newline is stripped so the
+    source stays readable in this script."""
+    FILES.append((path, content.lstrip("\n")))
+
+
+# -----------------------------------------------------------------------------
+# requirements.txt
+# -----------------------------------------------------------------------------
+add("requirements.txt", r"""
+Flask>=3.0
+Flask-Login>=0.6
+Flask-WTF>=1.2
+scikit-learn>=1.4
+pandas>=2.2
+numpy>=1.26
+joblib>=1.3
+matplotlib>=3.8
+""")
+
+
+# -----------------------------------------------------------------------------
+# sicca_calibration.py
+# -----------------------------------------------------------------------------
+add("sicca_calibration.py", r'''
+# =============================================================================
+# SICCA CALIBRATION MODULE
+# -----------------------------------------------------------------------------
+# Pure functions that expose the arithmetic of the Bayesian layer.
+#
+# Nothing in this module touches Flask, the database, or the filesystem.
+# Everything is passed in as an argument, so the module can be unit-tested
+# in isolation and cannot read data it was not given.
+# =============================================================================
+
+from __future__ import annotations
+
+from math import exp, isfinite, log1p
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
+
+
+def odds(p: float) -> float:
+    p = min(max(float(p), 1e-6), 1 - 1e-6)
+    return p / (1 - p)
+
+
+def prob(o: float) -> float:
+    return float(o) / (1.0 + float(o))
+
+
+def safe_float(value: Any, default: float) -> float:
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return default
+    return x if isfinite(x) else default
+
+
+def trace_case(
+    case: Mapping[str, Any],
+    *,
+    base_prior: float,
+    type_lr_map: Mapping[str, float],
+    status_lr_map: Mapping[str, float],
+    priority_lr_map: Mapping[str, float],
+    age_decay_lambda: float,
+    min_feature_lr: float,
+    max_feature_lr: float,
+    high_threshold: float,
+    medium_threshold: float,
+    current_year: int,
+) -> Dict[str, Any]:
+    ctype = str(case.get("type", "unknown")).lower()
+    type_lr = float(type_lr_map.get(ctype, 1.0))
+
+    ev_count = int(safe_float(case.get("evidence_count", 0), 0))
+    su_count = int(safe_float(case.get("suspects_count", 0), 0))
+    status = str(case.get("status", "unknown")).lower()
+    priority = str(case.get("priority", "medium")).lower()
+
+    ev_component = 1.0 + 0.35 * log1p(max(0, ev_count))
+    su_component = 1.0 + 0.10 * max(0, su_count - 1)
+    st_component = float(status_lr_map.get(status, 1.0))
+    pr_component = float(priority_lr_map.get(priority, 1.0))
+    ev_lr_raw = ev_component * su_component * st_component * pr_component
+    ev_lr = max(min_feature_lr, min(max_feature_lr, ev_lr_raw))
+
+    prior_odds = odds(base_prior)
+    posterior_odds = prior_odds * type_lr * ev_lr
+    posterior = prob(posterior_odds)
+
+    year = int(safe_float(case.get("year", current_year), current_year))
+    age = max(0, current_year - year)
+    base_conf = safe_float(case.get("confidence", 0.5), 0.5)
+    base_conf = max(0.0, min(1.0, base_conf))
+    decay_factor = exp(-age_decay_lambda * age)
+    decayed_conf = max(0.0, min(1.0, base_conf * decay_factor))
+    multiplier = 0.5 + 0.5 * decayed_conf
+    adjusted = posterior * multiplier
+
+    band = (
+        "high" if adjusted > high_threshold
+        else "medium" if adjusted > medium_threshold
+        else "low"
+    )
+
+    return {
+        "input": {
+            "type": ctype,
+            "evidence_count": ev_count,
+            "suspects_count": su_count,
+            "status": status,
+            "priority": priority,
+            "year": year,
+            "confidence": base_conf,
+        },
+        "configuration": {
+            "base_prior": float(base_prior),
+            "age_decay_lambda": float(age_decay_lambda),
+            "min_feature_lr": float(min_feature_lr),
+            "max_feature_lr": float(max_feature_lr),
+            "high_threshold": float(high_threshold),
+            "medium_threshold": float(medium_threshold),
+        },
+        "step_type_lr": {
+            "type_lr": type_lr,
+            "note": "likelihood ratio for the crime type",
+        },
+        "step_evidence_lr": {
+            "evidence_component": round(ev_component, 6),
+            "suspects_component": round(su_component, 6),
+            "status_component": round(st_component, 6),
+            "priority_component": round(pr_component, 6),
+            "raw_product": round(ev_lr_raw, 6),
+            "clamped": round(ev_lr, 6),
+            "clamped_hit": "none"
+                if abs(ev_lr_raw - ev_lr) < 1e-9
+                else ("min" if ev_lr_raw < ev_lr else "max"),
+        },
+        "step_bayes": {
+            "prior_probability": round(float(base_prior), 6),
+            "prior_odds": round(prior_odds, 6),
+            "posterior_odds": round(posterior_odds, 6),
+            "posterior_probability": round(posterior, 6),
+        },
+        "step_decay": {
+            "case_age_years": age,
+            "base_confidence": round(base_conf, 6),
+            "decay_factor": round(decay_factor, 6),
+            "decayed_confidence": round(decayed_conf, 6),
+            "multiplier": round(multiplier, 6),
+        },
+        "result": {
+            "posterior": round(posterior, 6),
+            "adjusted_posterior": round(adjusted, 6),
+            "band": band,
+        },
+    }
+
+
+def decay_curve(
+    *,
+    posterior: float,
+    confidence: float,
+    ages: Sequence[int],
+    age_decay_lambda: float,
+) -> List[Dict[str, float]]:
+    out: List[Dict[str, float]] = []
+    for age in ages:
+        age = int(age)
+        decayed = max(0.0, min(1.0, float(confidence)
+                                * exp(-age_decay_lambda * age)))
+        adjusted = float(posterior) * (0.5 + 0.5 * decayed)
+        out.append({
+            "age": float(age),
+            "decayed_confidence": round(decayed, 6),
+            "adjusted": round(adjusted, 6),
+        })
+    return out
+
+
+def decay_curve_png(
+    *,
+    curves: Mapping[str, Mapping[str, Any]],
+    high_threshold: float,
+    medium_threshold: float,
+    title: str,
+    path: str,
+    max_age: int = 60,
+) -> str:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        raise RuntimeError(f"matplotlib unavailable: {exc}") from exc
+
+    ages = list(range(0, max_age + 1))
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for label, cfg in curves.items():
+        points = decay_curve(
+            posterior=float(cfg["posterior"]),
+            confidence=float(cfg["confidence"]),
+            ages=ages,
+            age_decay_lambda=float(cfg.get("age_decay_lambda", 0.05)),
+        )
+        ax.plot([p["age"] for p in points],
+                [p["adjusted"] for p in points],
+                linewidth=2, label=label)
+
+    ax.axhline(high_threshold, color="#ef4444", linestyle="--",
+               linewidth=1.2, label=f"high threshold ({high_threshold})")
+    ax.axhline(medium_threshold, color="#f59e0b", linestyle="--",
+               linewidth=1.2, label=f"medium threshold ({medium_threshold})")
+
+    ax.set_xlabel("Case age (years)")
+    ax.set_ylabel("Adjusted posterior")
+    ax.set_title(title)
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.25)
+    ax.legend(loc="upper right", fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
+def band_for(score: float, high: float, medium: float) -> str:
+    return "high" if score > high else "medium" if score > medium else "low"
+
+
+def sensitivity_grid(
+    cases: Iterable[Mapping[str, Any]],
+    *,
+    priors: Sequence[float],
+    type_lrs: Sequence[float],
+    target_type: str,
+    status_lr_map: Mapping[str, float],
+    priority_lr_map: Mapping[str, float],
+    age_decay_lambda: float,
+    min_feature_lr: float,
+    max_feature_lr: float,
+    high_threshold: float,
+    medium_threshold: float,
+    current_year: int,
+    cap: int = 200,
+) -> Dict[str, Any]:
+    cases = list(cases)[:cap]
+    target_type = target_type.lower()
+
+    out_cases = []
+    for case in cases:
+        ctype = str(case.get("type", "unknown")).lower()
+        if ctype != target_type:
+            continue
+        trace = trace_case(
+            case,
+            base_prior=0.5,
+            type_lr_map={target_type: 1.0},
+            status_lr_map=status_lr_map,
+            priority_lr_map=priority_lr_map,
+            age_decay_lambda=age_decay_lambda,
+            min_feature_lr=min_feature_lr,
+            max_feature_lr=max_feature_lr,
+            high_threshold=high_threshold,
+            medium_threshold=medium_threshold,
+            current_year=current_year,
+        )
+        out_cases.append({
+            "case_id": case.get("case_id"),
+            "case_name": case.get("case_name"),
+            "year": case.get("year"),
+            "evidence_lr": trace["step_evidence_lr"]["clamped"],
+            "decay_multiplier": trace["step_decay"]["multiplier"],
+        })
+
+    grid = []
+    for prior in priors:
+        for tl in type_lrs:
+            bands: Dict[str, str] = {}
+            scores: Dict[str, float] = {}
+            for c in out_cases:
+                posterior = prob(odds(prior) * tl * c["evidence_lr"])
+                adjusted = posterior * c["decay_multiplier"]
+                scores[c["case_id"]] = round(adjusted, 6)
+                bands[c["case_id"]] = band_for(adjusted,
+                                               high_threshold, medium_threshold)
+            grid.append({
+                "prior": float(prior),
+                "type_lr": float(tl),
+                "scores": scores,
+                "bands": bands,
+            })
+
+    return {
+        "target_type": target_type,
+        "current_year": int(current_year),
+        "cases": out_cases,
+        "priors": [float(p) for p in priors],
+        "type_lrs": [float(t) for t in type_lrs],
+        "grid": grid,
+        "cap": cap,
+        "cases_seen": len(out_cases),
+        "high_threshold": float(high_threshold),
+        "medium_threshold": float(medium_threshold),
+    }
+
+
+def trace_summary(trace: Mapping[str, Any]) -> str:
+    r = trace["result"]
+    b = trace["step_bayes"]
+    d = trace["step_decay"]
+    return (
+        f"prior={b['prior_probability']:.2f} "
+        f"-> odds={b['prior_odds']:.3f} "
+        f"-> posterior={r['posterior']:.3f} "
+        f"-> decay(x{d['multiplier']:.2f}) "
+        f"-> adjusted={r['adjusted_posterior']:.3f} "
+        f"[{r['band']}]"
+    )
+''')
+# --- BEGIN PART 2 ---
+
+
+# -----------------------------------------------------------------------------
+# sicca_app.py
+# -----------------------------------------------------------------------------
+add("sicca_app.py", r'''
 #!/usr/bin/env python3
 # =============================================================================
 # SICCA v2.1 - Bayesian + Machine Learning Case Analysis (decision support)
 # -----------------------------------------------------------------------------
+# Complete, runnable rewrite. Highlights vs. the v2.0 file:
+#
+#  * Finishes the file: analyze route returns a response, create_app()
+#    returns the app, CLI + main block exist, train / export / download
+#    routes added.
+#  * Templates may live in ANY folders: the app searches every folder under
+#    the app root (and SICCA_TEMPLATE_DIRS) that contains .html files, and
+#    falls back to small built-in templates for anything missing.
+#  * SQLite connections are always closed; commit/rollback handled centrally.
+#  * Admin password is never written to the log file.
+#  * Uploads: extension + magic-byte check, orphan cleanup on failure,
+#    served only through an access-checked route.
+#  * Per-case authorization (admins see all; analysts see own/assigned).
+#  * Login throttling, session reset on login, secure cookie defaults,
+#    security headers.
+#  * Strict form validation (no silent coercion); enumerated type/status/
+#    priority.
+#  * Bayesian model reworked so "high" risk is reachable for every case type;
+#    startup check proves it. ML no longer takes the Bayesian posterior as
+#    an input (it was circular); model file is integrity-checked before
+#    loading.
+#  * pdfkit removed (wkhtmltopdf on user-entered text is an SSRF /
+#    local-file read risk). JSON export is provided instead.
+#  * Calibration tools added: /case/<id>/trace, /admin/decay_curve,
+#    /admin/sensitivity, and a `trace` CLI subcommand. See
+#    sicca_calibration.py.
+#
 # Run (development):
 #   pip install flask flask-login flask-wtf scikit-learn pandas numpy joblib
 #   export SICCA_ADMIN_PASS='a-strong-password-of-10+chars'   # first run only
-#   python sicca_app.py                     # same as: python sicca_app.py run
+#   python sicca_app.py                    # same as: python sicca_app.py run
 #
 # Other commands:
 #   python sicca_app.py create-user alice --role analyst
 #   python sicca_app.py train training.csv
-#   python sicca_app.py check-templates     # shows where each template was found
+#   python sicca_app.py check-templates
+#   python sicca_app.py trace <case_id>
 #
-# Production: gunicorn "sicca_app:create_app()"  (behind HTTPS; if behind a
-# reverse proxy also wrap the app in werkzeug's ProxyFix so client IPs are right)
+# Production: gunicorn "sicca_app:create_app()" (behind HTTPS; if behind a
+# reverse proxy also wrap the app in werkzeug's ProxyFix so client IPs are
+# right).
 #
 # Environment variables (all optional):
 #   SICCA_APP_ROOT, SICCA_BASE_DIR, SICCA_TEMPLATE_DIRS (os.pathsep-separated),
 #   SICCA_SECRET_KEY, SICCA_ADMIN_USER, SICCA_ADMIN_PASS, SICCA_HOST,
-#   SICCA_PORT, SICCA_DEBUG, SICCA_COOKIE_SECURE
+#   SICCA_PORT, SICCA_DEBUG, SICCA_COOKIE_SECURE,
+#   SICCA_SENSITIVITY_CAP, SICCA_DECAY_MAX_AGE
 #
 # Training CSV columns: type,status,priority,year,suspects_count,
-#   evidence_count,label   (label is 0/1)
+#                       evidence_count,label     (label is 0/1)
 # =============================================================================
 
 from __future__ import annotations
@@ -50,6 +801,7 @@ from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
 import joblib
 import numpy as np
 import pandas as pd
+
 from flask import (
     Flask, abort, flash, jsonify, redirect, render_template, request,
     send_file, session, url_for,
@@ -70,6 +822,16 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
+# Optional calibration module. If it is missing, the calibration routes
+# return 503 and everything else keeps working.
+try:
+    import sicca_calibration as calib
+except Exception as _calib_exc:
+    calib = None
+    _CALIB_IMPORT_ERROR = str(_calib_exc)
+else:
+    _CALIB_IMPORT_ERROR = ""
+
 
 # =============================================================================
 # CONFIGURATION
@@ -79,10 +841,10 @@ LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 class Config:
-    APP_ROOT = Path(os.environ.get("SICCA_APP_ROOT",
-                                   Path(__file__).resolve().parent)).resolve()
-    BASE_DIR = Path(os.environ.get("SICCA_BASE_DIR",
-                                   APP_ROOT / "sicca_data")).resolve()
+    APP_ROOT = Path(os.environ.get(
+        "SICCA_APP_ROOT", Path(__file__).resolve().parent)).resolve()
+    BASE_DIR = Path(os.environ.get(
+        "SICCA_BASE_DIR", APP_ROOT / "sicca_data")).resolve()
     CASES_DB = BASE_DIR / "sicca.db"
     LOGS_DIR = BASE_DIR / "logs"
     UPLOADS_DIR = BASE_DIR / "uploads"
@@ -92,6 +854,7 @@ class Config:
     ALLOWED_UPLOAD_EXTENSIONS = {
         ".pdf", ".doc", ".docx", ".txt", ".jpg", ".jpeg", ".png",
     }
+
     MODEL_PATH = MODELS_DIR / "sicca_pipeline.joblib"
     MODEL_HASH_PATH = MODELS_DIR / "sicca_pipeline.joblib.sha256"
     MODEL_VERSION = "2.1.0"
@@ -106,9 +869,13 @@ class Config:
     COOKIE_SECURE = (os.environ.get(
         "SICCA_COOKIE_SECURE",
         "0" if HOST in LOOPBACK_HOSTS else "1") == "1")
+
     PAGE_SIZE = 50
 
-    # Template discovery (see discover_template_dirs)
+    # Calibration tools (see sicca_calibration.py).
+    SENSITIVITY_CASE_CAP = int(os.environ.get("SICCA_SENSITIVITY_CAP", "200"))
+    SENSITIVITY_MAX_AGE = int(os.environ.get("SICCA_DECAY_MAX_AGE", "60"))
+
     TEMPLATE_SCAN_DEPTH = 4
     TEMPLATE_SKIP_DIRS = {
         ".git", "__pycache__", "node_modules", "venv", ".venv", "env",
@@ -127,7 +894,7 @@ def load_or_create_secret_key() -> str:
         return env
     Config.BASE_DIR.mkdir(parents=True, exist_ok=True)
     keyfile = Config.BASE_DIR / "secret.key"
-    try:  # create atomically with owner-only permissions
+    try:
         fd = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         key = keyfile.read_text().strip()
@@ -254,39 +1021,34 @@ def init_db() -> None:
     with db() as conn:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
-        # Migration for databases created by v2.0 (no created_by column).
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(cases)")}
         if "created_by" not in cols:
             conn.execute("ALTER TABLE cases ADD COLUMN "
                          "created_by TEXT NOT NULL DEFAULT ''")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_creator "
-                     "ON cases(created_by)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_creator "
+                         "ON cases(created_by)")
         n_users = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
-
-    if n_users:
-        return
+        if n_users:
+            return
     username = os.environ.get("SICCA_ADMIN_USER", "admin")
     supplied = os.environ.get("SICCA_ADMIN_PASS")
     password = supplied or secrets.token_urlsafe(14)
     try:
         create_user(username, password, "admin")
     except sqlite3.IntegrityError:
-        return  # another worker seeded it first
+        return
     if supplied:
         LOG.info("Seeded admin user '%s' from SICCA_ADMIN_PASS.", username)
     else:
-        # Printed to the terminal only. It is deliberately NOT sent to the log
-        # file, so it cannot end up in backups or log shippers.
         LOG.warning("Seeded admin user '%s' with a generated password "
                     "(shown once on stderr).", username)
-        print(f"\n*** SICCA initial admin login ***\n  user: {username}\n"
-              f"  pass: {password}\nStore it now; it is not saved anywhere.\n",
+        print(f"\n*** SICCA initial admin login ***\n user: {username}\n"
+              f" pass: {password}\nStore it now; it is not saved anywhere.\n",
               file=sys.stderr)
 
 
 def audit(actor: str, action: str, target: str, details: str = "",
           conn: Optional[sqlite3.Connection] = None) -> None:
-    """Pass `conn` to make the audit row part of the caller's transaction."""
     sql = ("INSERT INTO audit_log (ts, actor, action, target, details) "
            "VALUES (?,?,?,?,?)")
     params = (now_iso(), actor, action, target, details)
@@ -335,11 +1097,6 @@ def admin_required(f):
 
 
 class LoginThrottle:
-    """
-    In-memory failure counter (per process). Good enough for a single worker;
-    with several workers use Flask-Limiter with a shared store instead.
-    """
-
     def __init__(self, window: int = 900):
         self.window = window
         self._fails: Dict[str, Deque[float]] = defaultdict(deque)
@@ -370,7 +1127,6 @@ class LoginThrottle:
 
 
 THROTTLE = LoginThrottle()
-# Used so that "unknown user" takes as long as "wrong password".
 _DUMMY_HASH = generate_password_hash(secrets.token_hex(16))
 
 
@@ -379,7 +1135,6 @@ _DUMMY_HASH = generate_password_hash(secrets.token_hex(16))
 # =============================================================================
 
 CASE_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,50}$")
-
 CASE_TYPES = ("fraud", "homicide", "robbery", "arson", "burglary",
               "assault", "theft", "vandalism", "unknown")
 STATUSES = ("open", "under investigation", "pending trial", "closed")
@@ -387,7 +1142,7 @@ PRIORITIES = ("low", "medium", "high")
 
 
 class FormError(ValueError):
-    """Raised for user-correctable input problems."""
+    pass
 
 
 def validate_case_id(case_id: str) -> Tuple[bool, str]:
@@ -397,7 +1152,6 @@ def validate_case_id(case_id: str) -> Tuple[bool, str]:
 
 
 def clean_text(value: Any, max_len: int = 1000) -> str:
-    """Store raw text (Jinja escapes on render). Drops NULs/control chars."""
     if value is None:
         return ""
     text = str(value).replace("\x00", "")
@@ -443,7 +1197,6 @@ def parse_choice(raw: Any, label: str, choices: Tuple[str, ...],
     return value
 
 
-# Lenient helpers for values already in the database (never raise).
 def coerce_int(value: Any, default: int, lo: int, hi: int) -> int:
     try:
         n = int(float(value))
@@ -496,7 +1249,6 @@ def build_case_record(form: Mapping[str, Any], case_id: str,
 
 
 def sniff_matches(ext: str, head: bytes) -> bool:
-    """Cheap magic-byte check so a renamed file is not accepted."""
     if ext == ".pdf":
         return head.startswith(b"%PDF-")
     if ext in (".jpg", ".jpeg"):
@@ -512,8 +1264,7 @@ def sniff_matches(ext: str, head: bytes) -> bool:
     return False
 
 
-def prepare_upload(file, case_id: str) -> Optional[Tuple[Any, str, str]]:
-    """Validate (but do not save) an upload. Returns (file, stored, display)."""
+def prepare_upload(file, case_id: str):
     if not file or not file.filename:
         return None
     ext = Path(file.filename).suffix.lower()
@@ -524,24 +1275,15 @@ def prepare_upload(file, case_id: str) -> Optional[Tuple[Any, str, str]]:
     if not sniff_matches(ext, head):
         raise FormError("File contents do not match its extension.")
     display = secure_filename(file.filename) or f"upload{ext}"
-    stored = (f"{secure_filename(case_id)}__{uuid.uuid4().hex[:8]}__{display}")
+    stored = f"{secure_filename(case_id)}__{uuid.uuid4().hex[:8]}__{display}"
     return file, stored, display
 
 
 # =============================================================================
-# BAYESIAN MODEL  (heuristic and UNCALIBRATED - decision support only)
+# BAYESIAN MODEL (heuristic and UNCALIBRATED - decision support only)
 # =============================================================================
 
 class BayesianConfig:
-    """
-    All numbers below are hand-chosen assumptions, not fitted to data.
-
-    posterior odds = prior odds * type_LR * evidence_LR
-
-    v2.0 used a different prior per crime type, which made "high" unreachable
-    for most types (fraud topped out near 0.39). Here every case starts from
-    the same prior and the crime type only contributes a likelihood ratio.
-    """
     BASE_PRIOR = 0.30
     TYPE_LR = {
         "fraud": 1.2, "homicide": 2.0, "robbery": 1.6, "arson": 1.8,
@@ -591,13 +1333,11 @@ def bayesian_score(case: Mapping[str, Any], current_year: int) -> Dict[str, Any]
         str(case.get("priority", "medium")),
     )
     posterior = _prob(_odds(BayesianConfig.BASE_PRIOR) * type_lr * ev_lr)
-
     base_conf = coerce_float(case.get("confidence", 0.5), 0.5, 0.0, 1.0)
     year = coerce_int(case.get("year", current_year), current_year, 1900, 2100)
     age = max(0, current_year - year)
     decayed_conf = max(0.0, min(1.0, base_conf * exp(
         -BayesianConfig.AGE_DECAY_LAMBDA * age)))
-
     adjusted = posterior * (0.5 + 0.5 * decayed_conf)
     return {
         "posterior": float(posterior),
@@ -612,7 +1352,6 @@ def bayesian_score(case: Mapping[str, Any], current_year: int) -> Dict[str, Any]
 
 
 def max_reachable_score(ctype: str) -> float:
-    """Highest adjusted posterior possible for a type (conf=1, age=0)."""
     lr = (BayesianConfig.TYPE_LR.get(ctype, 1.0)
           * BayesianConfig.MAX_FEATURE_LR)
     return _prob(_odds(BayesianConfig.BASE_PRIOR) * lr)
@@ -631,9 +1370,6 @@ def check_risk_reachability() -> None:
 # =============================================================================
 
 CATEGORICAL = ["type", "status", "priority"]
-# "location" is deliberately excluded (proxy for demographics).
-# The Bayesian posterior is deliberately excluded too: feeding it in made the
-# ML score depend on the Bayesian score, so blending them double-counted it.
 NUMERIC = ["year", "suspects_count", "evidence_count"]
 TARGET = "label"
 FEATURE_SPEC = {"categorical": CATEGORICAL, "numeric": NUMERIC}
@@ -642,7 +1378,7 @@ FEATURE_SPEC = {"categorical": CATEGORICAL, "numeric": NUMERIC}
 def _make_ohe() -> OneHotEncoder:
     try:
         return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-    except TypeError:  # scikit-learn < 1.2
+    except TypeError:
         return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
 
@@ -682,9 +1418,6 @@ class MLModel:
         return self.path.exists()
 
     def load(self) -> Pipeline:
-        """Loads (and reloads if another worker retrained) after an
-        integrity check. joblib files are pickles: only load files that this
-        app wrote."""
         with self._lock:
             if not self.exists():
                 raise FileNotFoundError("Model not trained yet.")
@@ -701,7 +1434,8 @@ class MLModel:
             if meta.get("features") != FEATURE_SPEC:
                 raise RuntimeError(
                     "Model was trained with a different feature set; retrain.")
-            self._pipe, self._meta, self._mtime = artifact["pipeline"], meta, mtime
+            self._pipe, self._meta, self._mtime = (
+                artifact["pipeline"], meta, mtime)
             return self._pipe
 
     @property
@@ -717,7 +1451,6 @@ class MLModel:
                    if c not in df.columns]
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
-
         df = df[CATEGORICAL + NUMERIC + [TARGET]].copy()
         for c in CATEGORICAL:
             df[c] = df[c].astype(str).str.strip().str.lower()
@@ -726,7 +1459,6 @@ class MLModel:
         df = df.dropna()
         df = df[df[TARGET].isin([0, 1])]
         df[TARGET] = df[TARGET].astype(int)
-
         if len(df) < Config.MIN_TRAIN_ROWS:
             raise ValueError(
                 f"Only {len(df)} usable rows; at least "
@@ -736,17 +1468,14 @@ class MLModel:
             raise ValueError(
                 f"Each class (0 and 1) needs at least {Config.MIN_PER_CLASS} "
                 f"rows; got {counts.to_dict()}.")
-
         y = df[TARGET]
         X = df[CATEGORICAL + NUMERIC]
         X_tr, X_te, y_tr, y_te = train_test_split(
             X, y, test_size=0.25, random_state=42, stratify=y)
-
         pipe = build_pipeline()
         pipe.fit(X_tr, y_tr)
         prob = pipe.predict_proba(X_te)[:, 1]
         pred = (prob >= 0.5).astype(int)
-
         trained_at = now_iso()
         metrics = {
             "roc_auc": (_nan_to_none(float(roc_auc_score(y_te, prob)))
@@ -850,7 +1579,7 @@ class HybridEngine:
 
     @staticmethod
     def _ml_certainty(p: float) -> str:
-        d = abs(p - 0.5) * 2  # 0 = coin flip, 1 = fully certain either way
+        d = abs(p - 0.5) * 2
         return "high" if d > 0.6 else "medium" if d > 0.3 else "low"
 
     def analyze(self, case: Mapping[str, Any]) -> Dict[str, Any]:
@@ -858,7 +1587,6 @@ class HybridEngine:
         bayes = bayesian_score(case, datetime.now().year)
         ml_prob, ml_err = self.ml.predict_one(case)
         version = self.ml.meta.get("version", Config.MODEL_VERSION)
-
         if ml_prob is None:
             final = bayes["adjusted_posterior"]
             weights = {"bayesian": 1.0, "ml": 0.0}
@@ -873,7 +1601,6 @@ class HybridEngine:
                         "confidence": self._ml_certainty(ml_prob),
                         "model_available": True, "error": "",
                         "model_version": version}
-
         agreement = (ml_prob is not None
                      and abs(bayes["adjusted_posterior"] - ml_prob) <= 0.2)
         b = bayes["confidence"]
@@ -883,7 +1610,6 @@ class HybridEngine:
             overall = "high"
         else:
             overall = "medium" if b > 0.5 else "low"
-
         hybrid = {
             "final_risk_score": float(final),
             "risk_level": risk_level(final),
@@ -918,38 +1644,33 @@ class HybridEngine:
             out.append("Consider allocating additional resources.")
         elif risk == "medium":
             out.append("Medium risk score -- standard protocol.")
-
         ev = coerce_int(case.get("evidence_count", 0), 0, 0, 10000)
         if ev < 3:
             out.append("Limited evidence -- recommend evidence collection.")
         elif ev > 10:
             out.append("Substantial evidence -- focus on analysis.")
-
         su = coerce_int(case.get("suspects_count", 0), 0, 0, 1000)
         if su == 0:
             out.append("No suspects identified -- recommend suspect profiling.")
         elif su > 3:
             out.append("Multiple suspects -- consider connection analysis.")
-
         if ml.get("model_available"):
             out.append("Models agree." if hybrid["agreement"]
                        else "Models diverge -- recommend manual review.")
         else:
             out.append(f"{ml.get('error') or 'ML unavailable'}; "
                        "score is Bayesian-only.")
-
         yr = coerce_int(case.get("year", datetime.now().year),
                         datetime.now().year, 1900, 2100)
         if datetime.now().year - yr > 5:
             out.append("Case is aged -- consider evidence degradation.")
-
         out.append("Scores are uncalibrated decision support, not evidence; "
                    "a human must make the decision.")
         return out
 
 
 # =============================================================================
-# TEMPLATE DISCOVERY  (templates may live in any number of folders)
+# TEMPLATE DISCOVERY
 # =============================================================================
 
 REQUIRED_TEMPLATES = ("login.html", "dashboard.html", "create_case.html",
@@ -957,12 +1678,6 @@ REQUIRED_TEMPLATES = ("login.html", "dashboard.html", "create_case.html",
 
 
 def discover_template_dirs() -> List[Path]:
-    """
-    Order of precedence:
-      1. folders listed in SICCA_TEMPLATE_DIRS
-      2. every folder under APP_ROOT that directly contains .html files
-      3. APP_ROOT itself (so names like "auth/login.html" also resolve)
-    """
     found: List[Path] = []
 
     def add(p: Path) -> None:
@@ -973,11 +1688,13 @@ def discover_template_dirs() -> List[Path]:
     for raw in os.environ.get("SICCA_TEMPLATE_DIRS", "").split(os.pathsep):
         if raw.strip():
             add(Path(raw).expanduser())
-
     root = Config.APP_ROOT
     skip = set(Config.TEMPLATE_SKIP_DIRS) | {Config.BASE_DIR.name}
     for dirpath, dirnames, filenames in os.walk(root):
-        depth = len(Path(dirpath).relative_to(root).parts)
+        try:
+            depth = len(Path(dirpath).relative_to(root).parts)
+        except ValueError:
+            continue
         dirnames[:] = sorted(d for d in dirnames
                              if d not in skip and not d.startswith(".")
                              and depth < Config.TEMPLATE_SCAN_DEPTH)
@@ -988,7 +1705,6 @@ def discover_template_dirs() -> List[Path]:
 
 
 def template_index(dirs: List[Path]) -> Dict[str, Path]:
-    """name -> file that will actually be used (first folder wins)."""
     index: Dict[str, Path] = {}
     for d in dirs:
         for f in sorted(d.glob("*.html")):
@@ -1000,7 +1716,7 @@ def template_index(dirs: List[Path]) -> Dict[str, Path]:
     return index
 
 
-def build_template_loader() -> Tuple[ChoiceLoader, Dict[str, Path]]:
+def build_template_loader():
     dirs = discover_template_dirs()
     index = template_index(dirs)
     for name in REQUIRED_TEMPLATES:
@@ -1020,10 +1736,13 @@ FALLBACK_TEMPLATES = {
 <style>body{font:15px system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem}
 table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:.35rem .5rem;text-align:left}
 .flash{padding:.5rem .75rem;margin:.5rem 0;border-radius:4px;background:#eef}
-.error{background:#fdd}.success{background:#dfd}label{display:block;margin:.5rem 0}</style></head><body>
+.error{background:#fdd}.success{background:#dfd}label{display:block;margin:.5rem 0}
+pre{background:#f4f4f4;padding:.75rem;overflow:auto}</style></head><body>
 {% if current_user.is_authenticated %}<nav><a href="{{ url_for('dashboard') }}">Dashboard</a> |
 <a href="{{ url_for('create_case') }}">New case</a>
-{% if current_user.is_admin() %} | <a href="{{ url_for('train_model') }}">Train model</a>{% endif %}
+{% if current_user.is_admin() %} | <a href="{{ url_for('train_model') }}">Train model</a>
+ | <a href="{{ url_for('sensitivity_view') }}">Sensitivity</a>
+ | <a href="{{ url_for('decay_curve_view') }}">Decay curve</a>{% endif %}
 <form method="post" action="{{ url_for('logout') }}" style="display:inline">""" + _CSRF + """
 <button>Log out ({{ current_user.username }})</button></form></nav>{% endif %}
 {% with msgs = get_flashed_messages(with_categories=true) %}{% for cat, m in msgs %}
@@ -1069,8 +1788,9 @@ table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:.3
 <h1>{{ case.case_id }} &mdash; {{ case.case_name }}</h1>
 <table>{% for k, v in case.items() if k not in ('file_path',) %}<tr><th>{{ k }}</th><td>{{ v }}</td></tr>{% endfor %}</table>
 <p><a href="{{ url_for('analyze_case', case_id=case.case_id) }}">Run analysis</a>
+ | <a href="{{ url_for('trace_case_view', case_id=case.case_id) }}">Trace arithmetic</a>
 {% if case.attached_file %} | <a href="{{ url_for('download_file', case_id=case.case_id) }}">Download attachment</a>{% endif %}
-| <a href="{{ url_for('export_json', case_id=case.case_id) }}">Export JSON</a></p>{% endblock %}""",
+ | <a href="{{ url_for('export_json', case_id=case.case_id) }}">Export JSON</a></p>{% endblock %}""",
 
     "analysis.html": """{% extends "_fallback_base.html" %}{% block body %}
 <h1>Analysis: {{ case.case_id }}</h1>
@@ -1091,7 +1811,8 @@ AUC {{ model_meta.metrics.roc_auc }}, accuracy {{ '%.2f'|format(model_meta.metri
 <p>CSV columns: type, status, priority, year, suspects_count, evidence_count, label (0/1).
 Minimum {{ min_rows }} rows.</p>
 <form method="post" enctype="multipart/form-data">""" + _CSRF + """
-<input type="file" name="training_csv" accept=".csv" required> <button>Train</button></form>{% endblock %}""",
+<input type="file" name="training_csv" accept=".csv" required>
+<button>Train</button></form>{% endblock %}""",
 }
 
 
@@ -1107,8 +1828,7 @@ def create_app() -> Flask:
     app = Flask(__name__, template_folder=None,
                 static_folder=str(Config.APP_ROOT / "static"))
     loader, _ = build_template_loader()
-    app.jinja_loader = loader  # must be set before the first render
-
+    app.jinja_loader = loader
     app.config.update(
         SECRET_KEY=load_or_create_secret_key(),
         MAX_CONTENT_LENGTH=Config.MAX_CONTENT_LENGTH,
@@ -1125,7 +1845,7 @@ def create_app() -> Flask:
     ml = MLModel(Config.MODEL_PATH, Config.MODEL_HASH_PATH)
     engine = HybridEngine(ml)
 
-    # ------------------------------------------------------------ helpers
+    # -------------------------------------------------------------- helpers
     def can_access(row: sqlite3.Row) -> bool:
         if current_user.is_admin():
             return True
@@ -1134,7 +1854,6 @@ def create_app() -> Flask:
                 or (row["assigned_to"] or "").lower() == me)
 
     def scope() -> Tuple[str, Tuple[Any, ...]]:
-        """SQL WHERE fragment limiting rows to what the user may see."""
         if current_user.is_admin():
             return "1=1", ()
         me = current_user.username.lower()
@@ -1147,18 +1866,18 @@ def create_app() -> Flask:
         with db() as conn:
             row = conn.execute("SELECT * FROM cases WHERE case_id = ?",
                                (case_id,)).fetchone()
-        # 404 (not 403) so unauthorised users cannot probe which IDs exist.
         if row is None or not can_access(row):
             abort(404)
         return row
 
     def render_create(status: int = 200, **extra):
         return render_template(
-            "create_case.html", form=request.form if request.method == "POST"
-            else {}, types=CASE_TYPES, statuses=STATUSES,
+            "create_case.html",
+            form=request.form if request.method == "POST" else {},
+            types=CASE_TYPES, statuses=STATUSES,
             priorities=PRIORITIES, **extra), status
 
-    # ------------------------------------------------------------ hooks
+    # -------------------------------------------------------------- hooks
     @app.after_request
     def security_headers(resp):
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -1178,7 +1897,7 @@ def create_app() -> Flask:
         mb = Config.MAX_CONTENT_LENGTH // (1024 * 1024)
         return f"Upload too large (limit {mb} MB).", 413
 
-    # ------------------------------------------------------------ auth
+    # -------------------------------------------------------------- auth
     @app.route("/login", methods=["GET", "POST"])
     def login():
         if current_user.is_authenticated:
@@ -1194,7 +1913,6 @@ def create_app() -> Flask:
                 flash(f"Too many failed attempts. Try again in "
                       f"{wait // 60 + 1} minute(s).", "error")
                 return render_template("login.html"), 429
-
             with db() as conn:
                 row = conn.execute(
                     "SELECT id, username, password, role FROM users "
@@ -1203,12 +1921,11 @@ def create_app() -> Flask:
                 row["password"] if row else _DUMMY_HASH, password)
             if row and valid:
                 THROTTLE.clear(k_user)
-                session.clear()  # avoid session fixation
+                session.clear()
                 login_user(User(row["id"], row["username"], row["role"]))
                 session.permanent = True
                 audit(row["username"], "login", row["username"])
                 return redirect(url_for("dashboard"))
-
             THROTTLE.fail(k_user)
             THROTTLE.fail(k_ip)
             LOG.warning("Failed login for '%s' from %s", username[:50], ip)
@@ -1224,7 +1941,7 @@ def create_app() -> Flask:
         session.clear()
         return redirect(url_for("login"))
 
-    # ------------------------------------------------------------ dashboard
+    # -------------------------------------------------------------- dashboard
     @app.route("/")
     @login_required
     def index():
@@ -1261,13 +1978,12 @@ def create_app() -> Flask:
             model_available=ml.exists(),
             page=page, has_more=len(rows) > size)
 
-    # ------------------------------------------------------------ create
+    # -------------------------------------------------------------- create
     @app.route("/create_case", methods=["GET", "POST"])
     @login_required
     def create_case():
         if request.method == "GET":
             return render_create()
-
         saved_path: Optional[Path] = None
         try:
             case_id = clean_text(request.form.get("case_id"), 50)
@@ -1280,20 +1996,18 @@ def create_app() -> Flask:
         except FormError as exc:
             flash(str(exc), "error")
             return render_create(400)
-
         with db() as conn:
             if conn.execute("SELECT 1 FROM cases WHERE case_id = ?",
                             (case_id,)).fetchone():
                 flash("Case ID already exists", "error")
                 return render_create(409)
-
         try:
             if upload:
                 file, stored, display = upload
                 saved_path = Config.UPLOADS_DIR / stored
                 file.save(saved_path)
                 record["attached_file"] = display
-                record["file_path"] = stored  # relative to UPLOADS_DIR
+                record["file_path"] = stored
             with db() as conn:
                 conn.execute(
                     """INSERT INTO cases (case_id, case_name, location, year,
@@ -1307,7 +2021,7 @@ def create_app() -> Flask:
                     :modified)""", record)
                 audit(current_user.username, "create_case", case_id,
                       conn=conn)
-        except sqlite3.IntegrityError:  # lost a race on the primary key
+        except sqlite3.IntegrityError:
             _discard(saved_path)
             flash("Case ID already exists", "error")
             return render_create(409)
@@ -1317,11 +2031,10 @@ def create_app() -> Flask:
             LOG.exception("Failed to save case %s (ref %s)", case_id, ref)
             flash(f"Could not save the case. Reference: {ref}", "error")
             return render_create(500)
-
         flash(f"Case {case_id} created.", "success")
         return redirect(url_for("view_case", case_id=case_id))
 
-    # ------------------------------------------------------------ view
+    # -------------------------------------------------------------- view
     @app.route("/case/<case_id>")
     @login_required
     def view_case(case_id: str):
@@ -1342,7 +2055,7 @@ def create_app() -> Flask:
         return send_file(target, as_attachment=True,
                          download_name=row["attached_file"] or target.name)
 
-    # ------------------------------------------------------------ analysis
+    # -------------------------------------------------------------- analysis
     @app.route("/analyze/<case_id>")
     @login_required
     def analyze_case(case_id: str):
@@ -1365,7 +2078,119 @@ def create_app() -> Flask:
             f'attachment; filename="{secure_filename(case_id)}.json"')
         return resp
 
-    # ------------------------------------------------------------ admin
+    # -------------------------------------------------------------- calibration
+    @app.route("/case/<case_id>/trace")
+    @login_required
+    def trace_case_view(case_id: str):
+        if calib is None:
+            return (f"Calibration module unavailable: {_CALIB_IMPORT_ERROR}",
+                    503)
+        row = fetch_case(case_id)
+        case = dict(row)
+        trace = calib.trace_case(
+            case,
+            base_prior=BayesianConfig.BASE_PRIOR,
+            type_lr_map=BayesianConfig.TYPE_LR,
+            status_lr_map={
+                "open": 1.05, "under investigation": 1.15,
+                "pending trial": 1.25, "closed": 0.90,
+            },
+            priority_lr_map={"high": 1.10, "medium": 1.00, "low": 0.90},
+            age_decay_lambda=BayesianConfig.AGE_DECAY_LAMBDA,
+            min_feature_lr=BayesianConfig.MIN_FEATURE_LR,
+            max_feature_lr=BayesianConfig.MAX_FEATURE_LR,
+            high_threshold=BayesianConfig.HIGH,
+            medium_threshold=BayesianConfig.MEDIUM,
+            current_year=datetime.now().year,
+        )
+        audit(current_user.username, "trace_case", case_id)
+        return render_template("calibration_trace.html",
+                               case=case, trace=trace)
+
+    @app.route("/admin/decay_curve")
+    @admin_required
+    def decay_curve_view():
+        if calib is None:
+            return (f"Calibration module unavailable: {_CALIB_IMPORT_ERROR}",
+                    503)
+        try:
+            posterior = float(request.args.get("posterior", "0.75"))
+        except ValueError:
+            posterior = 0.75
+        try:
+            confidence = float(request.args.get("confidence", "0.8"))
+        except ValueError:
+            confidence = 0.8
+        posterior = max(0.0, min(1.0, posterior))
+        confidence = max(0.0, min(1.0, confidence))
+        out_dir = Config.BASE_DIR / "calibration"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / (
+            f"decay_{int(posterior*1000):04d}_{int(confidence*1000):04d}.png")
+        curves = {
+            "confidence = 0.4": {"posterior": posterior, "confidence": 0.4},
+            "confidence = 0.6": {"posterior": posterior, "confidence": 0.6},
+            "confidence = 0.8": {"posterior": posterior, "confidence": 0.8},
+            "confidence = 1.0": {"posterior": posterior, "confidence": 1.0},
+        }
+        try:
+            calib.decay_curve_png(
+                curves=curves,
+                high_threshold=BayesianConfig.HIGH,
+                medium_threshold=BayesianConfig.MEDIUM,
+                title=(f"SICCA adjusted score vs. case age\n"
+                       f"posterior = {posterior:.3f}"),
+                path=str(out_path),
+                max_age=Config.SENSITIVITY_MAX_AGE,
+            )
+        except RuntimeError as exc:
+            return f"Could not render chart: {exc}", 500
+        audit(current_user.username, "decay_curve", "model",
+              f"posterior={posterior:.3f} confidence={confidence:.3f}")
+        return send_file(out_path, mimetype="image/png")
+
+    @app.route("/admin/sensitivity")
+    @admin_required
+    def sensitivity_view():
+        if calib is None:
+            return (f"Calibration module unavailable: {_CALIB_IMPORT_ERROR}",
+                    503)
+        target_type = clean_text(request.args.get("type", "unknown"),
+                                 40).lower()
+        if target_type not in CASE_TYPES:
+            target_type = "unknown"
+        priors = [0.10, 0.20, 0.30, 0.40, 0.50]
+        type_lrs = [1.5, 2.0, 2.5, 3.0, 4.0]
+        where, params = scope()
+        with db() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM cases WHERE {where} "
+                "AND LOWER(type) = ? LIMIT ?",
+                params + (target_type, Config.SENSITIVITY_CASE_CAP),
+            ).fetchall()
+        grid = calib.sensitivity_grid(
+            [dict(r) for r in rows],
+            priors=priors, type_lrs=type_lrs, target_type=target_type,
+            status_lr_map={
+                "open": 1.05, "under investigation": 1.15,
+                "pending trial": 1.25, "closed": 0.90,
+            },
+            priority_lr_map={"high": 1.10, "medium": 1.00, "low": 0.90},
+            age_decay_lambda=BayesianConfig.AGE_DECAY_LAMBDA,
+            min_feature_lr=BayesianConfig.MIN_FEATURE_LR,
+            max_feature_lr=BayesianConfig.MAX_FEATURE_LR,
+            high_threshold=BayesianConfig.HIGH,
+            medium_threshold=BayesianConfig.MEDIUM,
+            current_year=datetime.now().year,
+            cap=Config.SENSITIVITY_CASE_CAP,
+        )
+        audit(current_user.username, "sensitivity", target_type,
+              f"cases={grid['cases_seen']} cap={grid['cap']}")
+        return render_template("calibration_sensitivity.html",
+                               grid=grid, case_types=CASE_TYPES,
+                               current_type=target_type)
+
+    # -------------------------------------------------------------- admin
     @app.route("/admin/train", methods=["GET", "POST"])
     @admin_required
     def train_model():
@@ -1407,7 +2232,6 @@ def create_app() -> Flask:
 
 
 def _discard(path: Optional[Path]) -> None:
-    """Remove a just-saved upload after a failed insert."""
     if path is not None:
         try:
             path.unlink(missing_ok=True)
@@ -1428,14 +2252,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     cu.add_argument("--role", choices=["analyst", "admin"], default="analyst")
     tr = sub.add_parser("train", help="train the ML model from a CSV")
     tr.add_argument("csv")
-    sub.add_parser("check-templates", help="show where templates are found")
+    sub.add_parser("check-templates",
+                   help="show where templates are found")
+    tr2 = sub.add_parser("trace",
+                         help="print the Bayesian arithmetic for one case")
+    tr2.add_argument("case_id")
     args = parser.parse_args(argv)
     cmd = args.cmd or "run"
 
     if cmd == "check-templates":
         _, index = build_template_loader()
         for name in REQUIRED_TEMPLATES:
-            print(f"{name:20s} -> {index.get(name, 'MISSING (built-in fallback)')}")
+            print(f"{name:20s} -> "
+                  f"{index.get(name, 'MISSING (built-in fallback)')}")
         extra = sorted(set(index) - set(REQUIRED_TEMPLATES))
         if extra:
             print("\nOther templates found:")
@@ -1470,7 +2299,40 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"(train {m['training_samples']}, test {m['test_samples']})")
         return 0
 
-    # run
+    if cmd == "trace":
+        if calib is None:
+            print(f"Calibration module unavailable: {_CALIB_IMPORT_ERROR}",
+                  file=sys.stderr)
+            return 1
+        with db() as conn:
+            row = conn.execute(
+                "SELECT * FROM cases WHERE case_id = ?", (args.case_id,)
+            ).fetchone()
+        if row is None:
+            print(f"No such case: {args.case_id}", file=sys.stderr)
+            return 1
+        trace = calib.trace_case(
+            dict(row),
+            base_prior=BayesianConfig.BASE_PRIOR,
+            type_lr_map=BayesianConfig.TYPE_LR,
+            status_lr_map={
+                "open": 1.05, "under investigation": 1.15,
+                "pending trial": 1.25, "closed": 0.90,
+            },
+            priority_lr_map={"high": 1.10, "medium": 1.00, "low": 0.90},
+            age_decay_lambda=BayesianConfig.AGE_DECAY_LAMBDA,
+            min_feature_lr=BayesianConfig.MIN_FEATURE_LR,
+            max_feature_lr=BayesianConfig.MAX_FEATURE_LR,
+            high_threshold=BayesianConfig.HIGH,
+            medium_threshold=BayesianConfig.MEDIUM,
+            current_year=datetime.now().year,
+        )
+        print(calib.trace_summary(trace))
+        print()
+        import json as _json
+        print(_json.dumps(trace, indent=2, default=str))
+        return 0
+
     if Config.DEBUG and Config.HOST not in LOOPBACK_HOSTS:
         print("Refusing to run with SICCA_DEBUG=1 on a non-loopback host: "
               "the Werkzeug debugger allows remote code execution.",
@@ -1482,3 +2344,321 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+''')
+
+
+# -----------------------------------------------------------------------------
+# templates/calibration_trace.html
+# -----------------------------------------------------------------------------
+add("templates/calibration_trace.html", r'''
+{% extends "_fallback_base.html" %}
+{% block body %}
+<h1>Case trace — {{ case.case_id }}</h1>
+<p><strong>{{ case.case_name }}</strong></p>
+
+<p><a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a>
+  &nbsp;|&nbsp;
+  <a href="{{ url_for('analyze_case', case_id=case.case_id) }}">Full analysis</a>
+</p>
+
+<h2>Inputs</h2>
+<table>
+  <tr><th>Type</th><td>{{ trace.input.type }}</td></tr>
+  <tr><th>Evidence count</th><td>{{ trace.input.evidence_count }}</td></tr>
+  <tr><th>Suspects count</th><td>{{ trace.input.suspects_count }}</td></tr>
+  <tr><th>Status</th><td>{{ trace.input.status }}</td></tr>
+  <tr><th>Priority</th><td>{{ trace.input.priority }}</td></tr>
+  <tr><th>Year</th><td>{{ trace.input.year }}</td></tr>
+  <tr><th>Stated confidence</th><td>{{ "%.3f"|format(trace.input.confidence) }}</td></tr>
+</table>
+
+<h2>Configuration used</h2>
+<table>
+  <tr><th>Base prior</th><td>{{ trace.configuration.base_prior }}</td></tr>
+  <tr><th>Age decay lambda</th><td>{{ trace.configuration.age_decay_lambda }}</td></tr>
+  <tr><th>Evidence LR clamp</th>
+      <td>{{ trace.configuration.min_feature_lr }} – {{ trace.configuration.max_feature_lr }}</td></tr>
+  <tr><th>High threshold</th><td>{{ trace.configuration.high_threshold }}</td></tr>
+  <tr><th>Medium threshold</th><td>{{ trace.configuration.medium_threshold }}</td></tr>
+</table>
+
+<h2>Step 1 — type likelihood ratio</h2>
+<table>
+  <tr><th>type_lr</th><td>{{ trace.step_type_lr.type_lr }}</td></tr>
+  <tr><th>note</th><td>{{ trace.step_type_lr.note }}</td></tr>
+</table>
+
+<h2>Step 2 — evidence likelihood ratio</h2>
+<p>The evidence LR is the product of four factors.</p>
+<table>
+  <tr><th>Evidence component</th>
+      <td>1 + 0.35 × ln(1 + {{ trace.input.evidence_count }}) = {{ trace.step_evidence_lr.evidence_component }}</td></tr>
+  <tr><th>Suspects component</th>
+      <td>1 + 0.10 × max(0, {{ trace.input.suspects_count }} − 1) = {{ trace.step_evidence_lr.suspects_component }}</td></tr>
+  <tr><th>Status component</th>
+      <td>{{ trace.input.status }} → {{ trace.step_evidence_lr.status_component }}</td></tr>
+  <tr><th>Priority component</th>
+      <td>{{ trace.input.priority }} → {{ trace.step_evidence_lr.priority_component }}</td></tr>
+  <tr><th>Raw product</th>
+      <td>{{ trace.step_evidence_lr.raw_product }}</td></tr>
+  <tr><th>After clamping</th>
+      <td>{{ trace.step_evidence_lr.clamped }}
+        {% if trace.step_evidence_lr.clamped_hit != 'none' %}
+          (clamped at {{ trace.step_evidence_lr.clamped_hit }})
+        {% endif %}
+      </td></tr>
+</table>
+
+<h2>Step 3 — Bayes update</h2>
+<table>
+  <tr><th>Prior probability</th><td>{{ trace.step_bayes.prior_probability }}</td></tr>
+  <tr><th>Prior odds</th>
+      <td>{{ trace.step_bayes.prior_probability }} / (1 − {{ trace.step_bayes.prior_probability }})
+          = {{ trace.step_bayes.prior_odds }}</td></tr>
+  <tr><th>Posterior odds</th>
+      <td>{{ trace.step_bayes.prior_odds }} × {{ trace.step_type_lr.type_lr }}
+          × {{ trace.step_evidence_lr.clamped }}
+          = {{ trace.step_bayes.posterior_odds }}</td></tr>
+  <tr><th>Posterior probability</th>
+      <td>{{ trace.step_bayes.posterior_odds }} / (1 + {{ trace.step_bayes.posterior_odds }})
+          = <strong>{{ trace.step_bayes.posterior_probability }}</strong></td></tr>
+</table>
+
+<h2>Step 4 — age decay</h2>
+<table>
+  <tr><th>Case age (years)</th><td>{{ trace.step_decay.case_age_years }}</td></tr>
+  <tr><th>Decay factor</th>
+      <td>exp(−{{ trace.configuration.age_decay_lambda }}
+          × {{ trace.step_decay.case_age_years }})
+          = {{ trace.step_decay.decay_factor }}</td></tr>
+  <tr><th>Base confidence</th><td>{{ trace.step_decay.base_confidence }}</td></tr>
+  <tr><th>Decayed confidence</th>
+      <td>{{ trace.step_decay.base_confidence }} × {{ trace.step_decay.decay_factor }}
+          = {{ trace.step_decay.decayed_confidence }}</td></tr>
+  <tr><th>Multiplier</th>
+      <td>0.5 + 0.5 × {{ trace.step_decay.decayed_confidence }}
+          = {{ trace.step_decay.multiplier }}</td></tr>
+</table>
+
+<h2>Result</h2>
+<table>
+  <tr><th>Posterior</th><td>{{ trace.result.posterior }}</td></tr>
+  <tr><th>Adjusted posterior</th>
+      <td>{{ trace.result.posterior }} × {{ trace.step_decay.multiplier }}
+          = <strong>{{ trace.result.adjusted_posterior }}</strong></td></tr>
+  <tr><th>Band</th><td><strong>{{ trace.result.band }}</strong></td></tr>
+</table>
+{% endblock %}
+''')
+
+
+# -----------------------------------------------------------------------------
+# templates/calibration_sensitivity.html
+# -----------------------------------------------------------------------------
+add("templates/calibration_sensitivity.html", r'''
+{% extends "_fallback_base.html" %}
+{% block body %}
+<h1>Sensitivity — {{ grid.target_type }}</h1>
+
+<p>
+  Risk band for every case of type <strong>{{ grid.target_type }}</strong>
+  across a grid of base prior × type likelihood ratio.
+  Current-year reference: {{ grid.current_year }}.
+  Thresholds: medium &gt; {{ grid.medium_threshold }},
+  high &gt; {{ grid.high_threshold }}.
+</p>
+
+<p>
+  Showing <strong>{{ grid.cases_seen }}</strong> case(s)
+  (cap {{ grid.cap }}).
+  {% if grid.cases_seen >= grid.cap %}
+    <span class="error">The cap was reached — not all matching cases are shown.</span>
+  {% endif %}
+</p>
+
+<form method="get" style="margin:1rem 0">
+  <label>Case type:
+    <select name="type" onchange="this.form.submit()">
+      {% for t in case_types %}
+        <option value="{{ t }}" {% if t == current_type %}selected{% endif %}>{{ t }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <noscript><button>Show</button></noscript>
+</form>
+
+{% if not grid.cases %}
+  <p>No cases of type <strong>{{ grid.target_type }}</strong> are visible to you.</p>
+{% else %}
+
+<h2>Cases included</h2>
+<table>
+  <tr>
+    <th>Case ID</th><th>Name</th><th>Year</th>
+    <th>Evidence LR</th><th>Decay multiplier</th>
+  </tr>
+  {% for c in grid.cases %}
+  <tr>
+    <td>{{ c.case_id }}</td>
+    <td>{{ c.case_name }}</td>
+    <td>{{ c.year }}</td>
+    <td>{{ c.evidence_lr }}</td>
+    <td>{{ c.decay_multiplier }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Band grid</h2>
+<p>
+  <span style="color:#10b981">L</span> = low,
+  <span style="color:#f59e0b">M</span> = medium,
+  <span style="color:#ef4444">H</span> = high.
+</p>
+
+{% for prior in grid.priors %}
+  <h3>prior = {{ "%.2f"|format(prior) }}</h3>
+  <table>
+    <tr>
+      <th>Case</th>
+      {% for tl in grid.type_lrs %}
+        <th>LR = {{ "%.1f"|format(tl) }}</th>
+      {% endfor %}
+    </tr>
+    {% for c in grid.cases %}
+    <tr>
+      <td>{{ c.case_id }}</td>
+      {% for tl in grid.type_lrs %}
+        {% set cell = (grid.grid | selectattr("prior", "equalto", prior)
+                                    | selectattr("type_lr", "equalto", tl)
+                                    | list | first) %}
+        {% set band = cell.bands[c.case_id] if cell else "?" %}
+        <td style="text-align:center">
+          {% if band == "high" %}<span style="color:#ef4444;font-weight:700">H</span>
+          {% elif band == "medium" %}<span style="color:#f59e0b;font-weight:700">M</span>
+          {% elif band == "low" %}<span style="color:#10b981;font-weight:700">L</span>
+          {% else %}?{% endif %}
+        </td>
+      {% endfor %}
+    </tr>
+    {% endfor %}
+  </table>
+{% endfor %}
+
+{% endif %}
+
+<p style="margin-top:2rem">
+  <a href="{{ url_for('dashboard') }}">Back to dashboard</a>
+</p>
+{% endblock %}
+''')
+
+
+# -----------------------------------------------------------------------------
+# make_zip.py (helper)
+# -----------------------------------------------------------------------------
+add("make_zip.py", r'''
+#!/usr/bin/env python3
+"""Zip up the SICCA project tree and print a manifest."""
+import zipfile
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+OUT = ROOT / f"sicca-complete-{datetime.now():%Y%m%d}.zip"
+
+INCLUDE = [
+    "sicca_app.py", "sicca_calibration.py", "requirements.txt",
+    "templates/",
+]
+
+def main() -> None:
+    written = []
+    with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as z:
+        for entry in INCLUDE:
+            p = ROOT / entry
+            if p.is_dir():
+                for f in sorted(p.rglob("*")):
+                    if f.is_file() and "__pycache__" not in f.parts:
+                        rel = f.relative_to(ROOT)
+                        z.write(f, rel)
+                        written.append(str(rel))
+            elif p.is_file():
+                rel = p.relative_to(ROOT)
+                z.write(p, rel)
+                written.append(str(rel))
+            else:
+                print(f"  (skipped, not found) {entry}")
+        manifest = "\n".join(sorted(written))
+        z.writestr("MANIFEST.txt",
+                   f"SICCA bundle generated {datetime.now().isoformat()}\n"
+                   f"{len(written)} files\n\n{manifest}\n")
+    print(f"\nWrote {OUT}")
+    print(f"{len(written)} files inside:")
+    for name in sorted(written):
+        print(f"  {name}")
+
+
+if __name__ == "__main__":
+    main()
+''')
+
+
+# =============================================================================
+# RUNNER
+# =============================================================================
+
+def write_tree(target: Path, force: bool) -> tuple[int, int]:
+    """Write every embedded file to `target`. Returns (written, skipped)."""
+    written = 0
+    skipped = 0
+    target = target.resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    for rel, content in FILES:
+        dest = target / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists() and not force:
+            print(f"  skip (exists)  {rel}")
+            skipped += 1
+            continue
+        dest.write_text(content, encoding="utf-8")
+        print(f"  wrote          {rel}  ({len(content):,} bytes)")
+        written += 1
+    return written, skipped
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Write the SICCA project tree to a directory.")
+    ap.add_argument("target", nargs="?", default="sicca_build",
+                    help="target directory (default: ./sicca_build)")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite existing files")
+    args = ap.parse_args()
+
+    target = Path(args.target)
+    print(f"SICCA installer -- writing {len(FILES)} files to {target.resolve()}")
+    print()
+    written, skipped = write_tree(target, args.force)
+    print()
+    print(f"Done. {written} file(s) written, {skipped} skipped.")
+    print()
+    print("Next steps:")
+    print(f"  cd {target}")
+    print("  python -m pip install -r requirements.txt")
+    print("  export SICCA_ADMIN_PASS='choose-a-strong-password'")
+    print("  python sicca_app.py")
+    print("  # open http://127.0.0.1:5000")
+    return 0
+
+
+if __name__ == "__main__":
+sys.exit(main())
+
+
+
+
+
+
+
+
+
