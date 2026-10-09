@@ -11,7 +11,7 @@ templates, and helper scripts -- to a target directory. Every file is
 embedded in this script, so it needs no network access and no source
 tree to run.
 
-Assemble this file from two parts (they were delivered separately).
+
 After assembly, run:
 
     python install_sicca.py [target-directory]
