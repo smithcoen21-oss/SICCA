@@ -1,0 +1,96 @@
+templates/calibration_sensitivity.html
+
+{% extends "_fallback_base.html" %}
+{% block body %}
+<h1>Sensitivity — {{ grid.target_type }}</h1>
+
+<p>
+  Risk band for every case of type <strong>{{ grid.target_type }}</strong>
+  across a grid of base prior × type likelihood ratio.
+  Current-year reference: {{ grid.current_year }}.
+  Thresholds: medium &gt; {{ grid.medium_threshold }},
+  high &gt; {{ grid.high_threshold }}.
+</p>
+
+<p>
+  Showing <strong>{{ grid.cases_seen }}</strong> case(s)
+  (cap {{ grid.cap }}).
+  {% if grid.cases_seen >= grid.cap %}
+    <span class="error">The cap was reached — not all matching cases are shown.</span>
+  {% endif %}
+</p>
+
+<form method="get" style="margin:1rem 0">
+  <label>Case type:
+    <select name="type" onchange="this.form.submit()">
+      {% for t in case_types %}
+        <option value="{{ t }}" {% if t == current_type %}selected{% endif %}>{{ t }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <noscript><button>Show</button></noscript>
+</form>
+
+{% if not grid.cases %}
+  <p>No cases of type <strong>{{ grid.target_type }}</strong> are visible to you.</p>
+{% else %}
+
+<h2>Cases included</h2>
+<table>
+  <tr>
+    <th>Case ID</th><th>Name</th><th>Year</th>
+    <th>Evidence LR</th><th>Decay multiplier</th>
+  </tr>
+  {% for c in grid.cases %}
+  <tr>
+    <td>{{ c.case_id }}</td>
+    <td>{{ c.case_name }}</td>
+    <td>{{ c.year }}</td>
+    <td>{{ c.evidence_lr }}</td>
+    <td>{{ c.decay_multiplier }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Band grid</h2>
+<p>
+  <span style="color:#10b981">L</span> = low,
+  <span style="color:#f59e0b">M</span> = medium,
+  <span style="color:#ef4444">H</span> = high.
+</p>
+
+{% for prior in grid.priors %}
+  <h3>prior = {{ "%.2f"|format(prior) }}</h3>
+  <table>
+    <tr>
+      <th>Case</th>
+      {% for tl in grid.type_lrs %}
+        <th>LR = {{ "%.1f"|format(tl) }}</th>
+      {% endfor %}
+    </tr>
+    {% for c in grid.cases %}
+    <tr>
+      <td>{{ c.case_id }}</td>
+      {% for tl in grid.type_lrs %}
+        {% set cell = (grid.grid | selectattr("prior", "equalto", prior)
+                                    | selectattr("type_lr", "equalto", tl)
+                                    | list | first) %}
+        {% set band = cell.bands[c.case_id] if cell else "?" %}
+        <td style="text-align:center">
+          {% if band == "high" %}<span style="color:#ef4444;font-weight:700">H</span>
+          {% elif band == "medium" %}<span style="color:#f59e0b;font-weight:700">M</span>
+          {% elif band == "low" %}<span style="color:#10b981;font-weight:700">L</span>
+          {% else %}?{% endif %}
+        </td>
+      {% endfor %}
+    </tr>
+    {% endfor %}
+  </table>
+{% endfor %}
+
+{% endif %}
+
+<p style="margin-top:2rem">
+  <a href="{{ url_for('dashboard') }}">Back to dashboard</a>
+</p>
+{% endblock %}
