@@ -1,11 +1,10 @@
-templates/calibration_trace.html
-
 {% extends "_fallback_base.html" %}
 {% block body %}
 <h1>Case trace — {{ case.case_id }}</h1>
 <p><strong>{{ case.case_name }}</strong></p>
 
-<p><a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a>
+<p>
+  <a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a>
   &nbsp;|&nbsp;
   <a href="{{ url_for('analyze_case', case_id=case.case_id) }}">Full analysis</a>
 </p>
@@ -38,7 +37,8 @@ templates/calibration_trace.html
 </table>
 
 <h2>Step 2 — evidence likelihood ratio</h2>
-<p>The evidence LR is the product of four factors. Each is shown so the arithmetic can be checked by hand.</p>
+<p>The evidence LR is the product of four factors. Each is shown so the
+arithmetic can be checked by hand.</p>
 <table>
   <tr><th>Evidence component</th>
       <td>1 + 0.35 × ln(1 + {{ trace.input.evidence_count }}) = {{ trace.step_evidence_lr.evidence_component }}</td></tr>
@@ -98,7 +98,7 @@ templates/calibration_trace.html
   <tr><th>Band</th><td><strong>{{ trace.result.band }}</strong></td></tr>
 </table>
 
-<p style="margin-top:2rem">
+<p class="muted" style="margin-top:2rem">
   Every number above is reproducible by hand from the inputs and the
   configuration. If any value differs from what you compute, the code and
   this page have diverged — report it.
