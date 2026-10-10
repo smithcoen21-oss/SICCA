@@ -1,5 +1,3 @@
-templates/calibration_sensitivity.html
-
 {% extends "_fallback_base.html" %}
 {% block body %}
 <h1>Sensitivity — {{ grid.target_type }}</h1>
@@ -32,7 +30,7 @@ templates/calibration_sensitivity.html
 </form>
 
 {% if not grid.cases %}
-  <p>No cases of type <strong>{{ grid.target_type }}</strong> are visible to you.</p>
+  <p class="muted">No cases of type <strong>{{ grid.target_type }}</strong> are visible to you.</p>
 {% else %}
 
 <h2>Cases included</h2>
@@ -53,7 +51,7 @@ templates/calibration_sensitivity.html
 </table>
 
 <h2>Band grid</h2>
-<p>
+<p class="muted">
   <span style="color:#10b981">L</span> = low,
   <span style="color:#f59e0b">M</span> = medium,
   <span style="color:#ef4444">H</span> = high.
