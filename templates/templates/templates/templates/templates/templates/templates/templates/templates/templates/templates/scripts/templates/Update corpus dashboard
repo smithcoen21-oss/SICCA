@@ -1,0 +1,152 @@
+{% extends "_fallback_base.html" %}
+{% block body %}
+<h1>Corpus dashboard</h1>
+<p>
+  Prevalence of case types, statuses, priorities, and conditions across
+  the cases visible to you. Counts are case-level. No individual is
+  identified.
+</p>
+
+<h2>Corpus summary</h2>
+<p><strong>{{ total }}</strong> case(s) in scope.</p>
+
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px">
+  <table>
+    <thead><tr><th>Type</th><th>Cases</th><th>%</th></tr></thead>
+    <tbody>
+      {% for r in by_type %}
+      <tr>
+        <td>{{ r.type }}</td>
+        <td style="text-align:right">{{ r.n }}</td>
+        <td style="text-align:right">
+          {{ "%.1f"|format(100.0 * r.n / total) if total else "0.0" }}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <table>
+    <thead><tr><th>Status</th><th>Cases</th><th>%</th></tr></thead>
+    <tbody>
+      {% for r in by_status %}
+      <tr>
+        <td>{{ r.status }}</td>
+        <td style="text-align:right">{{ r.n }}</td>
+        <td style="text-align:right">
+          {{ "%.1f"|format(100.0 * r.n / total) if total else "0.0" }}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <table>
+    <thead><tr><th>Priority</th><th>Cases</th><th>%</th></tr></thead>
+    <tbody>
+      {% for r in by_priority %}
+      <tr>
+        <td>{{ r.priority }}</td>
+        <td style="text-align:right">{{ r.n }}</td>
+        <td style="text-align:right">
+          {{ "%.1f"|format(100.0 * r.n / total) if total else "0.0" }}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<h2>Temporal window prevalence</h2>
+{% if temporal_prevalence %}
+<table>
+  <thead><tr><th>Window</th><th>Cases in window</th><th>% of corpus</th></tr></thead>
+  <tbody>
+    {% for r in temporal_prevalence %}
+    <tr>
+      <td>{{ r.window_id }}</td>
+      <td style="text-align:right">{{ r.count }}</td>
+      <td style="text-align:right">{{ r.pct }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No temporal matches recorded.</p>
+{% endif %}
+
+<h2>Weather condition prevalence</h2>
+{% if weather_prevalence %}
+<table>
+  <thead><tr><th>Condition</th><th>Case-days matched</th><th>% of corpus</th></tr></thead>
+  <tbody>
+    {% for r in weather_prevalence %}
+    <tr>
+      <td>{{ r.condition_id }}</td>
+      <td style="text-align:right">{{ r.count }}</td>
+      <td style="text-align:right">{{ r.pct }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p class="muted">
+  Weather counts are per observation, not per case. A case with three
+  observed days can contribute three matches to a single condition.
+</p>
+{% else %}
+<p class="muted">No weather matches recorded.</p>
+{% endif %}
+
+<h2>MO method prevalence</h2>
+{% if mo_prevalence %}
+<table>
+  <thead><tr><th>Method</th><th>Cases</th><th>% of corpus</th></tr></thead>
+  <tbody>
+    {% for r in mo_prevalence %}
+    <tr>
+      <td>{{ r.method_id }}</td>
+      <td style="text-align:right">{{ r.count }}</td>
+      <td style="text-align:right">{{ r.pct }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">
+  No methods attributed. Use the <strong>Method conditions</strong> page
+  on a case to attribute one.
+</p>
+{% endif %}
+
+<h2>What to look for</h2>
+<ul>
+  <li>
+    <strong>A condition that appears in most cases.</strong> If
+    <code>WC-RAIN-ANY</code> appears in 60% of the corpus, it is a common
+    condition, not a pattern. Rarity is what makes a condition
+    informative.
+  </li>
+  <li>
+    <strong>A condition that appears in a small but consistent
+    subset.</strong> If <code>WC-SNOW-ANY</code> appears in five cases out
+    of three hundred, that is worth looking at.
+  </li>
+  <li>
+    <strong>An MO method that appears more often than the case type would
+    suggest.</strong> If <code>MO-WINDOW-ENTRY</code> appears in a third
+    of your burglaries, that is the baseline. If it appears in half, that
+    is a different distribution.
+  </li>
+  <li>
+    <strong>Nothing.</strong> If no condition stands out, the corpus may
+    be too small, or the conditions may not be the right ones. Both are
+    useful findings.
+  </li>
+</ul>
+
+<p class="muted">
+  This page reports prevalence, not association. A condition appearing in
+  many cases does not establish that it contributed to any of them. It
+  is a starting point for the analyst, not a conclusion.
+</p>
+{% endblock %}
