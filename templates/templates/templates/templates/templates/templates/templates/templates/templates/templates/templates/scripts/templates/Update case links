@@ -1,0 +1,101 @@
+{% extends "_fallback_base.html" %}
+{% block body %}
+<h1>Linked cases — {{ case.case_id }}</h1>
+<p><strong>{{ case.case_name }}</strong></p>
+
+<p>
+  <a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a>
+  &nbsp;|&nbsp;
+  <a href="{{ url_for('temporal_view', case_id=case.case_id) }}">Temporal</a>
+  &nbsp;|&nbsp;
+  <a href="{{ url_for('weather_view', case_id=case.case_id) }}">Weather</a>
+  &nbsp;|&nbsp;
+  <a href="{{ url_for('mo_view', case_id=case.case_id) }}">Method conditions</a>
+</p>
+
+<h2>Condition signature of this case</h2>
+<table>
+  <tr>
+    <th>Temporal windows</th>
+    <td>
+      {% for w in result.target.signature.temporal %}{{ w }} {% else %}—{% endfor %}
+    </td>
+  </tr>
+  <tr>
+    <th>Weather conditions</th>
+    <td>
+      {% for w in result.target.signature.weather %}{{ w }} {% else %}—{% endfor %}
+    </td>
+  </tr>
+  <tr>
+    <th>MO methods</th>
+    <td>
+      {% for w in result.target.signature.mo %}{{ w }} {% else %}—{% endfor %}
+    </td>
+  </tr>
+</table>
+
+<h2>Cases sharing one or more conditions</h2>
+{% if result.links %}
+  <p><strong>{{ result.links|length }}</strong> case(s) share at least
+     one condition with this one.
+     {% if result.truncated %}<span class="error">Truncated to 50.</span>{% endif %}
+  </p>
+  <table>
+    <thead>
+      <tr><th>Case</th><th>Shared count</th><th>Temporal</th>
+          <th>Weather</th><th>MO</th><th>Rarest shared</th><th>Jaccard</th></tr>
+    </thead>
+    <tbody>
+      {% for link in result.links %}
+      <tr>
+        <td>
+          <a href="{{ url_for('view_case', case_id=link.case_id) }}">
+            {{ link.case_id }}</a><br>
+          <span class="muted">{{ link.case_name }}</span>
+        </td>
+        <td style="text-align:center"><strong>{{ link.shared_count }}</strong></td>
+        <td>{% for s in link.shared.temporal %}{{ s }}<br>{% else %}—{% endfor %}</td>
+        <td>{% for s in link.shared.weather %}{{ s }}<br>{% else %}—{% endfor %}</td>
+        <td>{% for s in link.shared.mo %}{{ s }}<br>{% else %}—{% endfor %}</td>
+        <td>
+          {% if link.rarest_shared %}
+            {{ link.rarest_shared.id }}<br>
+            <span class="muted">prev. {{ "%.4f"|format(link.rarest_shared.prevalence) }}</span>
+          {% else %}—{% endif %}
+        </td>
+        <td style="text-align:center">{{ "%.3f"|format(link.jaccard) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <p>No other case in the corpus shares a condition with this one.</p>
+{% endif %}
+
+<h2>Condition prevalence across the corpus</h2>
+<table>
+  <thead><tr><th>Condition</th><th>Cases with it</th><th>Prevalence</th></tr></thead>
+  <tbody>
+    {% for cid, info in prevalence.items()|sort(attribute='1.prevalence') %}
+    <tr>
+      <td>{{ cid }}</td>
+      <td style="text-align:center">{{ info.case_count }}</td>
+      <td style="text-align:center">{{ "%.4f"|format(info.prevalence) }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="3" class="muted">No conditions in the corpus yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h2>What this panel does and does not mean</h2>
+<ul>
+  <li>It shows shared conditions, not shared offenders.</li>
+  <li>It does not identify an offender.</li>
+  <li>It does not rank suspects.</li>
+  <li>The rarest-shared-condition column matters most.</li>
+  <li>Jaccard is context, not a probability.</li>
+  <li>It is decision support, not evidence.</li>
+</ul>
+{% endblock %}
