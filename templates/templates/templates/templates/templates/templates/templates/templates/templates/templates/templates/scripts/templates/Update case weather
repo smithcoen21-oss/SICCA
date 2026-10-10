@@ -1,0 +1,63 @@
+{% extends "_fallback_base.html" %}
+{% block body %}
+<h1>Weather context — {{ case.case_id }}</h1>
+<p><strong>{{ case.case_name }}</strong></p>
+
+<p>
+  <a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a>
+  &nbsp;|&nbsp;
+  <a href="{{ url_for('temporal_view', case_id=case.case_id) }}">Temporal</a>
+</p>
+
+{% if not profile.ok %}
+  <h2>Weather profile not available</h2>
+  <table>
+    <tr><th>Reason</th><td>{{ profile.reason }}</td></tr>
+    {% if profile.detail %}<tr><th>Detail</th><td>{{ profile.detail }}</td></tr>{% endif %}
+  </table>
+{% else %}
+  <h2>Observations</h2>
+  <p><strong>{{ profile.days|length }}</strong> day(s) evaluated.</p>
+
+  {% for day in profile.days %}
+    <h3>{{ day.obs_date }} — station {{ day.station_id }}</h3>
+    <table>
+      <thead>
+        <tr><th>Condition</th><th>Matched</th><th>Observed</th>
+            <th>Threshold</th><th>Base rate</th><th>LR</th></tr>
+      </thead>
+      <tbody>
+        {% for c in day.conditions %}
+        <tr>
+          <td>{{ c.condition_id }}</td>
+          <td>{% if c.matched %}<strong>yes</strong>{% else %}no{% endif %}</td>
+          <td>{% if c.value is not none %}{{ "%.2f"|format(c.value) }}{% else %}—{% endif %}</td>
+          <td>{{ c.threshold }}</td>
+          <td>{% if c.base_rate is defined and c.base_rate is not none %}{{ "%.4f"|format(c.base_rate) }}{% else %}—{% endif %}</td>
+          <td>{% if c.likelihood_ratio is defined and c.likelihood_ratio is not none %}{{ "%.2f"|format(c.likelihood_ratio) }}{% else %}—{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endfor %}
+
+  <h2>Matched conditions (across all days)</h2>
+  {% if profile.matched_condition_ids %}
+    <ul>
+      {% for cid in profile.matched_condition_ids %}<li>{{ cid }}</li>{% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted">No conditions matched on any observed day.</p>
+  {% endif %}
+
+  <h2>Summary</h2>
+  <p>{{ profile.summary }}</p>
+
+  <h2>What this does not establish</h2>
+  <ul>
+    <li>It does not identify anyone.</li>
+    <li>It does not establish that weather caused the offence.</li>
+    <li>It is not evidence.</li>
+  </ul>
+{% endif %}
+{% endblock %}
