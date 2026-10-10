@@ -1,0 +1,65 @@
+{% extends "_fallback_base.html" %}
+{% block body %}
+<h1>Temporal context — {{ case.case_id }}</h1>
+<p><strong>{{ case.case_name }}</strong></p>
+
+<p>
+  <a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a>
+  &nbsp;|&nbsp;
+  <a href="{{ url_for('analyze_case', case_id=case.case_id) }}">Full analysis</a>
+</p>
+
+{% if not profile.ok %}
+  <h2>Temporal profile not available</h2>
+  <table>
+    <tr><th>Reason</th><td>{{ profile.reason }}</td></tr>
+    {% if profile.detail %}<tr><th>Detail</th><td>{{ profile.detail }}</td></tr>{% endif %}
+  </table>
+{% else %}
+  <h2>Case time context</h2>
+  <table>
+    <tr><th>Date</th><td>{{ profile.case.date }}</td></tr>
+    <tr><th>Time of day</th><td>{{ profile.case.time_of_day }}</td></tr>
+    <tr><th>Inside fixed summer window</th>
+        <td>{{ "yes" if profile.case.is_summer else "no" }}
+          <span class="muted">(15 June – 15 September)</span></td></tr>
+  </table>
+
+  <h2>Matched windows</h2>
+  {% if profile.matched %}
+  <table>
+    <thead>
+      <tr><th>Window</th><th>Season</th><th>Local time</th>
+          <th>Activity</th><th>Base rate</th><th>LR</th></tr>
+    </thead>
+    <tbody>
+      {% for m in profile.matched %}
+      <tr>
+        <td><strong>{{ m.name }}</strong><br><span class="muted">{{ m.window_id }}</span></td>
+        <td>{{ m.season }}</td>
+        <td>{{ m.start_local }} – {{ m.end_local }}</td>
+        <td>{{ m.activity_level }}</td>
+        <td>{{ "%.4f"|format(m.base_rate) }}</td>
+        <td>{{ "%.2f"|format(m.likelihood_ratio) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p><strong>Combined temporal LR:</strong>
+     {{ "%.2f"|format(profile.combined_temporal_lr) }}</p>
+  {% else %}
+  <p>The case time does not fall inside any window in the reference table.</p>
+  {% endif %}
+
+  <h2>Summary</h2>
+  <p>{{ profile.summary }}</p>
+
+  <h2>What this does not establish</h2>
+  <ul>
+    <li>It does not identify anyone.</li>
+    <li>It does not establish the offence occurred at this time — it
+        reflects the time recorded in the case file.</li>
+    <li>It is not evidence.</li>
+  </ul>
+{% endif %}
+{% endblock %}
