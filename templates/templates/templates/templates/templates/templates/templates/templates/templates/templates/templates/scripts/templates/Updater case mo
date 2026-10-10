@@ -1,0 +1,155 @@
+{% extends "_fallback_base.html" %}
+{% block body %}
+<h1>Method conditions — {{ case.case_id }}</h1>
+<p><strong>{{ case.case_name }}</strong></p>
+
+<p>
+  <a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a>
+  &nbsp;|&nbsp;
+  <a href="{{ url_for('temporal_view', case_id=case.case_id) }}">Temporal</a>
+  &nbsp;|&nbsp;
+  <a href="{{ url_for('weather_view', case_id=case.case_id) }}">Weather</a>
+  &nbsp;|&nbsp;
+  <a href="{{ url_for('case_links_view', case_id=case.case_id) }}">Linked cases</a>
+</p>
+
+<h2>Attributed methods</h2>
+{% if attributed %}
+  <table>
+    <thead>
+      <tr><th>Method</th><th>Confidence</th><th>Basis</th>
+          <th>Attributed by</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for a in attributed %}
+      <tr>
+        <td>
+          {% if all_methods[a.method_id] is defined %}
+            <strong>{{ all_methods[a.method_id].name }}</strong><br>
+          {% endif %}
+          <span class="muted">{{ a.method_id }}</span>
+        </td>
+        <td style="text-align:center">
+          {% if a.confidence is not none %}{{ "%.2f"|format(a.confidence) }}
+          {% else %}—{% endif %}
+        </td>
+        <td>{{ a.confidence_note }}</td>
+        <td>{{ a.attributed_by }}<br>
+            <span class="muted">{{ a.created_on[:19] }}</span></td>
+        <td>
+          <form method="post"
+                action="{{ url_for('mo_remove',
+                                   case_id=case.case_id,
+                                   method_id=a.method_id) }}"
+                onsubmit="return confirm('Remove this attribution?');"
+                style="display:inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit"
+                    style="padding:4px 10px;font-size:12px">
+              Remove
+            </button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <p>
+    No method is attributed to this case. The attribution below is the
+    analyst's judgement about how the offence was carried out, based on
+    what the case file records. It is not inferred by the tool.
+  </p>
+{% endif %}
+
+<h3>Attribute a method</h3>
+<form method="post"
+      action="{{ url_for('mo_attribute', case_id=case.case_id) }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+  <label>Method
+    <select name="method_id" required>
+      <option value="">Select a method…</option>
+      {% for m in methods_available %}
+        <option value="{{ m.method_id }}">
+          {{ m.name }} — {{ m.category }}
+        </option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <label>Confidence (0.0 – 1.0)
+    <input type="number" name="confidence"
+           min="0" max="1" step="0.05" value="0.5">
+  </label>
+
+  <label>Basis for the attribution
+    <textarea name="confidence_note" rows="4" required maxlength="2000"
+              placeholder="State what in the case file supports this
+method. 'Pattern analysis' is not a basis. A named fact from the case
+file is."></textarea>
+  </label>
+
+  <button type="submit">Attribute method</button>
+</form>
+
+<h2>Observed variables</h2>
+<table>
+  <tr><th>Variable</th><th>Value</th><th>Source</th></tr>
+  {% for k, v in observed.items()|sort %}
+  <tr>
+    <td>{{ k }}</td>
+    <td>{% if v is number %}{{ "%.2f"|format(v) }}{% else %}{{ v }}{% endif %}</td>
+    <td class="muted">
+      {% if k.startswith("TW-") %}temporal window match
+      {% else %}weather observation{% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="3" class="muted">No observed variables available.</td></tr>
+  {% endfor %}
+</table>
+
+{% if profile.ok %}
+<h2>Evaluation</h2>
+{% for m in profile.methods %}
+  <h3>{{ m.method_name }}
+      <span class="muted">({{ m.method_id }})</span></h3>
+  <p><strong>Verdict:</strong> {{ m.verdict }}</p>
+  <p>{{ m.explanation }}</p>
+  <table>
+    <thead>
+      <tr><th>Condition</th><th>Effect</th><th>Observed</th>
+          <th>Threshold</th><th>Verdict</th></tr>
+    </thead>
+    <tbody>
+      {% for r in m.results %}
+      <tr>
+        <td>{{ r.condition_id }}</td>
+        <td>{{ r.effect }}</td>
+        <td>{% if r.value is not none %}{{ r.value }}{% else %}—{% endif %}</td>
+        <td>{{ r.threshold }}</td>
+        <td>
+          {% if r.verdict == "satisfied" %}<span style="color:#10b981">satisfied</span>
+          {% elif r.verdict == "violated" %}<span style="color:#ef4444">violated</span>
+          {% elif r.verdict == "absent" %}<span style="color:#f59e0b">absent</span>
+          {% else %}{{ r.verdict }}{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endfor %}
+{% endif %}
+
+<h2>Summary</h2>
+<p>{{ profile.summary }}</p>
+
+<h2>What this does not establish</h2>
+<ul>
+  <li>It evaluates physical conditions, not intent.</li>
+  <li>The attribution of a method is an analytical judgement.</li>
+  <li>A "compatible" verdict is not evidence.</li>
+  <li>An "incompatible" verdict is a filter, not a conclusion.</li>
+</ul>
+{% endblock %}
