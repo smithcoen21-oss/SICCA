@@ -1,94 +1,106 @@
 {% extends "_fallback_base.html" %}
 {% block body %}
-<h1>Sensitivity — {{ grid.target_type }}</h1>
+<h1>Case trace — {{ case.case_id }}</h1>
+<p><strong>{{ case.case_name }}</strong></p>
 
 <p>
-  Risk band for every case of type <strong>{{ grid.target_type }}</strong>
-  across a grid of base prior × type likelihood ratio.
-  Current-year reference: {{ grid.current_year }}.
-  Thresholds: medium &gt; {{ grid.medium_threshold }},
-  high &gt; {{ grid.high_threshold }}.
+  <a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a>
+  &nbsp;|&nbsp;
+  <a href="{{ url_for('analyze_case', case_id=case.case_id) }}">Full analysis</a>
 </p>
 
-<p>
-  Showing <strong>{{ grid.cases_seen }}</strong> case(s)
-  (cap {{ grid.cap }}).
-  {% if grid.cases_seen >= grid.cap %}
-    <span class="error">The cap was reached — not all matching cases are shown.</span>
-  {% endif %}
-</p>
-
-<form method="get" style="margin:1rem 0">
-  <label>Case type:
-    <select name="type" onchange="this.form.submit()">
-      {% for t in case_types %}
-        <option value="{{ t }}" {% if t == current_type %}selected{% endif %}>{{ t }}</option>
-      {% endfor %}
-    </select>
-  </label>
-  <noscript><button>Show</button></noscript>
-</form>
-
-{% if not grid.cases %}
-  <p class="muted">No cases of type <strong>{{ grid.target_type }}</strong> are visible to you.</p>
-{% else %}
-
-<h2>Cases included</h2>
+<h2>Inputs</h2>
 <table>
-  <tr>
-    <th>Case ID</th><th>Name</th><th>Year</th>
-    <th>Evidence LR</th><th>Decay multiplier</th>
-  </tr>
-  {% for c in grid.cases %}
-  <tr>
-    <td>{{ c.case_id }}</td>
-    <td>{{ c.case_name }}</td>
-    <td>{{ c.year }}</td>
-    <td>{{ c.evidence_lr }}</td>
-    <td>{{ c.decay_multiplier }}</td>
-  </tr>
-  {% endfor %}
+  <tr><th>Type</th><td>{{ trace.input.type }}</td></tr>
+  <tr><th>Evidence count</th><td>{{ trace.input.evidence_count }}</td></tr>
+  <tr><th>Suspects count</th><td>{{ trace.input.suspects_count }}</td></tr>
+  <tr><th>Status</th><td>{{ trace.input.status }}</td></tr>
+  <tr><th>Priority</th><td>{{ trace.input.priority }}</td></tr>
+  <tr><th>Year</th><td>{{ trace.input.year }}</td></tr>
+  <tr><th>Stated confidence</th><td>{{ "%.3f"|format(trace.input.confidence) }}</td></tr>
 </table>
 
-<h2>Band grid</h2>
-<p class="muted">
-  <span style="color:#10b981">L</span> = low,
-  <span style="color:#f59e0b">M</span> = medium,
-  <span style="color:#ef4444">H</span> = high.
-</p>
+<h2>Configuration used</h2>
+<table>
+  <tr><th>Base prior</th><td>{{ trace.configuration.base_prior }}</td></tr>
+  <tr><th>Age decay lambda</th><td>{{ trace.configuration.age_decay_lambda }}</td></tr>
+  <tr><th>Evidence LR clamp</th>
+      <td>{{ trace.configuration.min_feature_lr }} – {{ trace.configuration.max_feature_lr }}</td></tr>
+  <tr><th>High threshold</th><td>{{ trace.configuration.high_threshold }}</td></tr>
+  <tr><th>Medium threshold</th><td>{{ trace.configuration.medium_threshold }}</td></tr>
+</table>
 
-{% for prior in grid.priors %}
-  <h3>prior = {{ "%.2f"|format(prior) }}</h3>
-  <table>
-    <tr>
-      <th>Case</th>
-      {% for tl in grid.type_lrs %}
-        <th>LR = {{ "%.1f"|format(tl) }}</th>
-      {% endfor %}
-    </tr>
-    {% for c in grid.cases %}
-    <tr>
-      <td>{{ c.case_id }}</td>
-      {% for tl in grid.type_lrs %}
-        {% set cell = (grid.grid | selectattr("prior", "equalto", prior)
-                                    | selectattr("type_lr", "equalto", tl)
-                                    | list | first) %}
-        {% set band = cell.bands[c.case_id] if cell else "?" %}
-        <td style="text-align:center">
-          {% if band == "high" %}<span style="color:#ef4444;font-weight:700">H</span>
-          {% elif band == "medium" %}<span style="color:#f59e0b;font-weight:700">M</span>
-          {% elif band == "low" %}<span style="color:#10b981;font-weight:700">L</span>
-          {% else %}?{% endif %}
-        </td>
-      {% endfor %}
-    </tr>
-    {% endfor %}
-  </table>
-{% endfor %}
+<h2>Step 1 — type likelihood ratio</h2>
+<table>
+  <tr><th>type_lr</th><td>{{ trace.step_type_lr.type_lr }}</td></tr>
+  <tr><th>note</th><td>{{ trace.step_type_lr.note }}</td></tr>
+</table>
 
-{% endif %}
+<h2>Step 2 — evidence likelihood ratio</h2>
+<p>The evidence LR is the product of four factors. Each is shown so the
+arithmetic can be checked by hand.</p>
+<table>
+  <tr><th>Evidence component</th>
+      <td>1 + 0.35 × ln(1 + {{ trace.input.evidence_count }}) = {{ trace.step_evidence_lr.evidence_component }}</td></tr>
+  <tr><th>Suspects component</th>
+      <td>1 + 0.10 × max(0, {{ trace.input.suspects_count }} − 1) = {{ trace.step_evidence_lr.suspects_component }}</td></tr>
+  <tr><th>Status component</th>
+      <td>{{ trace.input.status }} → {{ trace.step_evidence_lr.status_component }}</td></tr>
+  <tr><th>Priority component</th>
+      <td>{{ trace.input.priority }} → {{ trace.step_evidence_lr.priority_component }}</td></tr>
+  <tr><th>Raw product</th>
+      <td>{{ trace.step_evidence_lr.raw_product }}</td></tr>
+  <tr><th>After clamping</th>
+      <td>{{ trace.step_evidence_lr.clamped }}
+        {% if trace.step_evidence_lr.clamped_hit != 'none' %}
+          (clamped at {{ trace.step_evidence_lr.clamped_hit }})
+        {% endif %}
+      </td></tr>
+</table>
 
-<p style="margin-top:2rem">
-  <a href="{{ url_for('dashboard') }}">Back to dashboard</a>
+<h2>Step 3 — Bayes update</h2>
+<table>
+  <tr><th>Prior probability</th><td>{{ trace.step_bayes.prior_probability }}</td></tr>
+  <tr><th>Prior odds</th>
+      <td>{{ trace.step_bayes.prior_probability }} / (1 − {{ trace.step_bayes.prior_probability }})
+          = {{ trace.step_bayes.prior_odds }}</td></tr>
+  <tr><th>Posterior odds</th>
+      <td>{{ trace.step_bayes.prior_odds }} × {{ trace.step_type_lr.type_lr }}
+          × {{ trace.step_evidence_lr.clamped }}
+          = {{ trace.step_bayes.posterior_odds }}</td></tr>
+  <tr><th>Posterior probability</th>
+      <td>{{ trace.step_bayes.posterior_odds }} / (1 + {{ trace.step_bayes.posterior_odds }})
+          = <strong>{{ trace.step_bayes.posterior_probability }}</strong></td></tr>
+</table>
+
+<h2>Step 4 — age decay</h2>
+<table>
+  <tr><th>Case age (years)</th><td>{{ trace.step_decay.case_age_years }}</td></tr>
+  <tr><th>Decay factor</th>
+      <td>exp(−{{ trace.configuration.age_decay_lambda }}
+          × {{ trace.step_decay.case_age_years }})
+          = {{ trace.step_decay.decay_factor }}</td></tr>
+  <tr><th>Base confidence</th><td>{{ trace.step_decay.base_confidence }}</td></tr>
+  <tr><th>Decayed confidence</th>
+      <td>{{ trace.step_decay.base_confidence }} × {{ trace.step_decay.decay_factor }}
+          = {{ trace.step_decay.decayed_confidence }}</td></tr>
+  <tr><th>Multiplier</th>
+      <td>0.5 + 0.5 × {{ trace.step_decay.decayed_confidence }}
+          = {{ trace.step_decay.multiplier }}</td></tr>
+</table>
+
+<h2>Result</h2>
+<table>
+  <tr><th>Posterior</th><td>{{ trace.result.posterior }}</td></tr>
+  <tr><th>Adjusted posterior</th>
+      <td>{{ trace.result.posterior }} × {{ trace.step_decay.multiplier }}
+          = <strong>{{ trace.result.adjusted_posterior }}</strong></td></tr>
+  <tr><th>Band</th><td><strong>{{ trace.result.band }}</strong></td></tr>
+</table>
+
+<p class="muted" style="margin-top:2rem">
+  Every number above is reproducible by hand from the inputs and the
+  configuration. If any value differs from what you compute, the code and
+  this page have diverged — report it.
 </p>
 {% endblock %}
