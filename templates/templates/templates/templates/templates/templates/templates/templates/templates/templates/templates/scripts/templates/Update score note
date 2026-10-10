@@ -1,0 +1,29 @@
+templates/_score_note.html
+
+{#
+  Shared note shown on every page that displays a score.
+  The constants displayed are supplied by a context processor in
+  sicca_app.py, so they always match the running configuration.
+#}
+<div style="background:#fff8e1;border-left:4px solid #f59e0b;
+            padding:12px 16px;margin:0 0 20px 0;border-radius:4px;
+            font-size:14px;line-height:1.5">
+  <strong>About the score on this page.</strong>
+  It is a <strong>priority rank within a narrow band</strong>, produced
+  by arithmetic that has not been calibrated against case outcomes.
+  It is <strong>not a probability</strong> of anything, and it is
+  <strong>not evidence</strong>. A person — the analyst — is responsible
+  for every action taken on the case.
+  <details style="margin-top:8px">
+    <summary style="cursor:pointer;color:#b45309">
+      Show the constants behind this number
+    </summary>
+    <div style="margin-top:8px;font-size:13px;color:#78350f">
+      Base prior: <strong>{{ score_note_constants.base_prior }}</strong> &nbsp;|&nbsp;
+      High threshold: <strong>{{ score_note_constants.high }}</strong> &nbsp;|&nbsp;
+      Medium threshold: <strong>{{ score_note_constants.medium }}</strong> &nbsp;|&nbsp;
+      Age decay λ: <strong>{{ score_note_constants.age_decay_lambda }}</strong> &nbsp;|&nbsp;
+      Evidence LR clamp: <strong>{{ score_note_constants.min_feature_lr }}–{{ score_note_constants.max_feature_lr }}</strong>
+    </div>
+  </details>
+</div>
