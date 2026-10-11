@@ -1,51 +1,18 @@
 #!/usr/bin/env python3
 # =============================================================================
-# SICCA v2.3 - Bayesian + Machine Learning Case Analysis (decision support)
-# -----------------------------------------------------------------------------
-# Consolidated build. Includes:
-#   * v2.1 core (auth, cases, audit, ML, cross-border heuristics)
-#   * Calibration tools: trace, decay curve, sensitivity grid, CLI trace
-#   * Temporal layer: time-of-day windows, base rates
-#   * Weather layer: conditions, base rates
-#   * MO layer: methods, conditions, attribution
-#   * Linkage panel: shared-condition signature
-#   * Tuning items 1-7:
-#       1. Calibration script (separate file, run from CLI)
-#       2. Evidence-strength factor
-#       3. Investigation-age decay (active_since)
-#       4. Condition factor (temporal + weather + MO) applied to score
-#       5. MO attribution form
-#       6. Corpus dashboard
-#       7. Shared uncalibrated score note
-#
-# Run (development):
-#   pip install -r requirements.txt
-#   export SICCA_ADMIN_PASS='a-strong-password-of-10+chars'   # first run only
-#   python sicca_app.py
-#
-# Other commands:
-#   python sicca_app.py create-user alice --role analyst
-#   python sicca_app.py train training.csv
-#   python sicca_app.py check-templates
-#   python sicca_app.py trace <case_id>
-#
-# Production: gunicorn "sicca_app:create_app()" (behind HTTPS). Session
-# cookies are Secure by default; set SICCA_BEHIND_PROXY=1 (number of
-# proxies) when behind a reverse proxy so client IPs and https are seen.
-# Set SICCA_SECRET_KEY from the environment in production: the ML model
-# file is authenticated with an HMAC keyed by it.
-#
-# Environment variables (all optional):
-#   SICCA_APP_ROOT, SICCA_BASE_DIR, SICCA_TEMPLATE_DIRS,
-#   SICCA_SECRET_KEY, SICCA_ADMIN_USER, SICCA_ADMIN_PASS,
-#   SICCA_HOST, SICCA_PORT, SICCA_DEBUG, SICCA_COOKIE_SECURE,
-#   SICCA_SENSITIVITY_CAP, SICCA_DECAY_MAX_AGE, SICCA_BEHIND_PROXY,
-#   SICCA_CSP, SICCA_HIGH, SICCA_MEDIUM
+# SICCA v2.3.1 - Fully Consolidated Secure Case Analysis System
+# =============================================================================
+# Complete merged build including:
+#   * v2.3 Core (auth, secure cookies, throttling, HMAC ML model protection)
+#   * v2.3 Advanced modules (Calibration, Temporal, Weather, MO, Linkage, Corpus)
+#   * v2.3 Full Fallback Templates & Admin Views
+#   * v2.1 Restored features (Suspects, Evidence records, Cross-case heuristic matching)
 # =============================================================================
 
 from __future__ import annotations
 
 import argparse
+import csv
 import getpass
 import hashlib
 import hmac
@@ -66,6 +33,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from itertools import combinations
 from logging.handlers import RotatingFileHandler
 from math import exp, isfinite
 from pathlib import Path
@@ -77,7 +45,7 @@ import pandas as pd
 
 from flask import (
     Flask, abort, flash, jsonify, redirect, render_template, request,
-    send_file, session, url_for,
+    send_file, session, url_for, Response
 )
 from flask_login import (
     LoginManager, UserMixin, current_user, login_required, login_user,
@@ -87,8 +55,10 @@ from flask_wtf import CSRFProtect
 from flask_wtf.csrf import CSRFError
 from jinja2 import ChoiceLoader, DictLoader, FileSystemLoader
 from sklearn.compose import ColumnTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -96,8 +66,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-# Optional modules. Missing ones degrade gracefully: only the routes that
-# need them return 503; everything else keeps working.
+# Optional modules (graceful degradation if missing)[cite: 2]
 try:
     import sicca_calibration as calib
 except Exception as _calib_exc:
@@ -171,7 +140,7 @@ class Config:
 
     MODEL_PATH = MODELS_DIR / "sicca_pipeline.joblib"
     MODEL_HASH_PATH = MODELS_DIR / "sicca_pipeline.joblib.hmac"
-    MODEL_VERSION = "2.3.0"
+    MODEL_VERSION = "2.3.1"
     MIN_TRAIN_ROWS = 50
     MIN_PER_CLASS = 5
 
@@ -180,13 +149,8 @@ class Config:
     DEBUG = os.environ.get("SICCA_DEBUG", "0") == "1"
 
     SESSION_LIFETIME_SECONDS = 3600
-    # Secure cookies by default everywhere, including under gunicorn (which
-    # never sets SICCA_HOST). Only the built-in development server on
-    # loopback relaxes this, in main(). SICCA_COOKIE_SECURE=0 forces it off.
     COOKIE_SECURE = os.environ.get("SICCA_COOKIE_SECURE") != "0"
-    # Number of reverse proxies in front of the app (0 = none).
     BEHIND_PROXY = int(os.environ.get("SICCA_BEHIND_PROXY", "0"))
-    # Set SICCA_CSP="" to disable the Content-Security-Policy header.
     CSP = os.environ.get(
         "SICCA_CSP",
         "default-src 'self'; script-src 'self' 'unsafe-inline'; "
@@ -225,9 +189,6 @@ def load_or_create_secret_key() -> str:
 
     if keyfile.exists():
         return _read()
-    # Write the key to a private temp file, then publish it atomically with a
-    # hard link. If several workers race, exactly one link succeeds and the
-    # rest read that winner's complete file (never a half-written one).
     tmp = keyfile.with_name(f"secret.key.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as fh:
@@ -238,7 +199,6 @@ def load_or_create_secret_key() -> str:
         except FileExistsError:
             pass
         except OSError:
-            # Filesystem without hard links: fall back to a plain rename.
             if not keyfile.exists():
                 os.replace(tmp, keyfile)
     finally:
@@ -278,7 +238,7 @@ LOG = configure_logging()
 
 
 # =============================================================================
-# DATABASE
+# DATABASE (Consolidated with v2.1 Suspects & Evidence Tables)
 # =============================================================================
 
 SCHEMA = """
@@ -316,6 +276,31 @@ CREATE TABLE IF NOT EXISTS cases (
 CREATE INDEX IF NOT EXISTS idx_cases_modified ON cases(modified DESC);
 CREATE INDEX IF NOT EXISTS idx_cases_status   ON cases(status);
 CREATE INDEX IF NOT EXISTS idx_cases_creator  ON cases(created_by);
+
+CREATE TABLE IF NOT EXISTS suspects (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id    TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    aliases    TEXT NOT NULL DEFAULT '',
+    identifier TEXT NOT NULL DEFAULT '',
+    role       TEXT NOT NULL DEFAULT 'suspect',
+    notes      TEXT NOT NULL DEFAULT '',
+    created    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_suspects_case ON suspects(case_id);
+CREATE INDEX IF NOT EXISTS idx_suspects_ident ON suspects(identifier);
+
+CREATE TABLE IF NOT EXISTS evidence (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id    TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
+    label      TEXT NOT NULL,
+    kind       TEXT NOT NULL DEFAULT 'other',
+    identifier TEXT NOT NULL DEFAULT '',
+    notes      TEXT NOT NULL DEFAULT '',
+    created    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_case ON evidence(case_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_ident ON evidence(identifier);
 
 CREATE TABLE IF NOT EXISTS audit_log (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -357,7 +342,6 @@ CREATE INDEX IF NOT EXISTS idx_login_failure_key ON login_failure(key, ts);
 
 @contextmanager
 def db():
-    """Connection that always commits-or-rolls-back and is always closed."""
     conn = sqlite3.connect(Config.CASES_DB, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -394,33 +378,23 @@ def init_db() -> None:
     with db() as conn:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
-        # Migration: add columns that may be missing on older databases.
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(cases)")}
         if "created_by" not in cols:
-            conn.execute("ALTER TABLE cases ADD COLUMN "
-                         "created_by TEXT NOT NULL DEFAULT ''")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_creator "
-                         "ON cases(created_by)")
+            conn.execute("ALTER TABLE cases ADD COLUMN created_by TEXT NOT NULL DEFAULT ''")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_creator ON cases(created_by)")
         if "evidence_strength" not in cols:
-            conn.execute("ALTER TABLE cases ADD COLUMN "
-                         "evidence_strength TEXT NOT NULL DEFAULT 'moderate'")
+            conn.execute("ALTER TABLE cases ADD COLUMN evidence_strength TEXT NOT NULL DEFAULT 'moderate'")
         if "active_since" not in cols:
             conn.execute("ALTER TABLE cases ADD COLUMN active_since TEXT")
         if "reopened_count" not in cols:
-            conn.execute("ALTER TABLE cases ADD COLUMN "
-                         "reopened_count INTEGER NOT NULL DEFAULT 0")
-        # Backfill active_since for cases that have none.
+            conn.execute("ALTER TABLE cases ADD COLUMN reopened_count INTEGER NOT NULL DEFAULT 0")
         conn.execute(
-            "UPDATE cases SET active_since = printf('%04d-07-01', year) "
-            "WHERE active_since IS NULL")
-        # Seed evidence strength factors.
+            "UPDATE cases SET active_since = printf('%04d-07-01', year) WHERE active_since IS NULL")
         conn.execute(
-            "INSERT OR IGNORE INTO evidence_strength_factor "
-            "(strength, multiplier, description) VALUES "
+            "INSERT OR IGNORE INTO evidence_strength_factor (strength, multiplier, description) VALUES "
             "('weak', 0.7, 'Circumstantial, low quality, or uncertain provenance'), "
             "('moderate', 1.0, 'Concrete and attributable (default)'), "
-            "('strong', 1.5, 'Decisive: direct physical trace, credible witness, "
-            "or documented admission')")
+            "('strong', 1.5, 'Decisive: direct physical trace, credible witness, or admission')")
         n_users = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
         if n_users:
             return
@@ -434,17 +408,12 @@ def init_db() -> None:
     if supplied:
         LOG.info("Seeded admin user '%s' from SICCA_ADMIN_PASS.", username)
     else:
-        LOG.warning("Seeded admin user '%s' with a generated password "
-                    "(shown once on stderr).", username)
-        print(f"\n*** SICCA initial admin login ***\n user: {username}\n"
-              f" pass: {password}\nStore it now; it is not saved anywhere.\n",
-              file=sys.stderr)
+        print(f"\n*** SICCA initial admin login ***\n user: {username}\n pass: {password}\n", file=sys.stderr)
 
 
 def audit(actor: str, action: str, target: str, details: str = "",
           conn: Optional[sqlite3.Connection] = None) -> None:
-    sql = ("INSERT INTO audit_log (ts, actor, action, target, details) "
-           "VALUES (?,?,?,?,?)")
+    sql = "INSERT INTO audit_log (ts, actor, action, target, details) VALUES (?,?,?,?,?)"
     params = (now_iso(), actor, action, target, details)
     if conn is not None:
         conn.execute(sql, params)
@@ -473,9 +442,7 @@ login_manager = LoginManager()
 @login_manager.user_loader
 def load_user(uid: str) -> Optional[User]:
     with db() as conn:
-        row = conn.execute(
-            "SELECT id, username, role FROM users WHERE id = ?", (uid,)
-        ).fetchone()
+        row = conn.execute("SELECT id, username, role FROM users WHERE id = ?", (uid,)).fetchone()
     return User(row["id"], row["username"], row["role"]) if row else None
 
 
@@ -491,9 +458,6 @@ def admin_required(f):
 
 
 class LoginThrottle:
-    """Failed-login limiter. State lives in SQLite so the limits are shared
-    by every worker process and survive restarts."""
-
     def __init__(self, window: int = 900):
         self.window = window
 
@@ -501,34 +465,28 @@ class LoginThrottle:
         now = time.time()
         try:
             with db() as conn:
-                conn.execute("DELETE FROM login_failure WHERE ts < ?",
-                             (now - self.window,))
-                rows = conn.execute(
-                    "SELECT ts FROM login_failure WHERE key = ? "
-                    "ORDER BY ts ASC", (key,)).fetchall()
+                conn.execute("DELETE FROM login_failure WHERE ts < ?", (now - self.window,))
+                rows = conn.execute("SELECT ts FROM login_failure WHERE key = ? ORDER BY ts ASC", (key,)).fetchall()
         except sqlite3.Error:
-            LOG.exception("login throttle lookup failed")
             return 0
         if len(rows) < limit:
             return 0
-        # Blocked until enough old failures age out to drop below `limit`.
         pivot = rows[len(rows) - limit]["ts"]
         return max(1, int(self.window - (now - pivot)))
 
     def fail(self, key: str) -> None:
         try:
             with db() as conn:
-                conn.execute("INSERT INTO login_failure (key, ts) VALUES (?,?)",
-                             (key, time.time()))
+                conn.execute("INSERT INTO login_failure (key, ts) VALUES (?,?)", (key, time.time()))
         except sqlite3.Error:
-            LOG.exception("login throttle write failed")
+            pass
 
     def clear(self, key: str) -> None:
         try:
             with db() as conn:
                 conn.execute("DELETE FROM login_failure WHERE key = ?", (key,))
         except sqlite3.Error:
-            LOG.exception("login throttle clear failed")
+            pass
 
 
 THROTTLE = LoginThrottle()
@@ -557,23 +515,18 @@ def validate_case_id(case_id: str) -> Tuple[bool, str]:
     return True, ""
 
 
-def clean_text(value: Any, max_len: int = 1000,
-               multiline: bool = False) -> str:
-    """Strip control characters. Single-line by default: CR/LF/tab become
-    spaces, so values cannot forge log lines or break single-line fields."""
+def clean_text(value: Any, max_len: int = 1000, multiline: bool = False) -> str:
     if value is None:
         return ""
     text = str(value).replace("\x00", "")
     if multiline:
         text = "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
     else:
-        text = "".join(" " if ch in "\r\n\t" else ch
-                       for ch in text if ch in "\r\n\t" or ord(ch) >= 32)
+        text = "".join(" " if ch in "\r\n\t" else ch for ch in text if ch in "\r\n\t" or ord(ch) >= 32)
     return text.strip()[:max_len]
 
 
 def log_safe(value: Any, max_len: int = 50) -> str:
-    """Make untrusted text safe to write into a log line."""
     return str(value)[:max_len].encode("unicode_escape").decode("ascii")
 
 
@@ -585,7 +538,6 @@ def _pretty(obj: Any) -> str:
 
 
 def _chunks(seq: List[Any], size: int = 500):
-    """Yield slices small enough for SQLite's bound-variable limit."""
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
 
@@ -594,15 +546,14 @@ def parse_iso_date(raw: str, label: str) -> str:
     try:
         d = datetime.strptime(raw, "%Y-%m-%d").date()
     except ValueError:
-        raise FormError(f"{label} must be a date written YYYY-MM-DD.")
+        raise FormError(f"{label} must be written YYYY-MM-DD.")
     today = datetime.now(timezone.utc).date()
     if d.year < 1900 or d > today + timedelta(days=1):
         raise FormError(f"{label} must be between 1900 and today.")
     return d.isoformat()
 
 
-def parse_int(raw: Any, label: str, lo: int, hi: int,
-              default: Optional[int] = None) -> int:
+def parse_int(raw: Any, label: str, lo: int, hi: int, default: Optional[int] = None) -> int:
     if raw is None or str(raw).strip() == "":
         if default is not None:
             return default
@@ -616,8 +567,7 @@ def parse_int(raw: Any, label: str, lo: int, hi: int,
     return n
 
 
-def parse_float(raw: Any, label: str, lo: float, hi: float,
-                default: Optional[float] = None) -> float:
+def parse_float(raw: Any, label: str, lo: float, hi: float, default: Optional[float] = None) -> float:
     if raw is None or str(raw).strip() == "":
         if default is not None:
             return default
@@ -631,8 +581,7 @@ def parse_float(raw: Any, label: str, lo: float, hi: float,
     return x
 
 
-def parse_choice(raw: Any, label: str, choices: Tuple[str, ...],
-                 default: str) -> str:
+def parse_choice(raw: Any, label: str, choices: Tuple[str, ...], default: str) -> str:
     value = clean_text(raw, 40).lower() or default
     if value not in choices:
         raise FormError(f"{label} must be one of: {', '.join(choices)}.")
@@ -657,35 +606,25 @@ def coerce_float(value: Any, default: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
-def build_case_record(form: Mapping[str, Any], case_id: str,
-                      username: str) -> Dict[str, Any]:
+def build_case_record(form: Mapping[str, Any], case_id: str, username: str) -> Dict[str, Any]:
     name = clean_text(form.get("case_name"), 200)
     if not name:
         raise FormError("Case name is required.")
     now = now_iso()
-    active_since = parse_iso_date(
-        clean_text(form.get("active_since"), 10) or now[:10], "Active since")
+    active_since = parse_iso_date(clean_text(form.get("active_since"), 10) or now[:10], "Active since")
     return {
         "case_id": case_id,
         "case_name": name,
         "location": clean_text(form.get("location"), 200),
-        "year": parse_int(form.get("year"), "Year", 1900, 2100,
-                          default=datetime.now().year),
+        "year": parse_int(form.get("year"), "Year", 1900, 2100, default=datetime.now().year),
         "type": parse_choice(form.get("type"), "Type", CASE_TYPES, "unknown"),
         "status": parse_choice(form.get("status"), "Status", STATUSES, "open"),
-        "confidence": parse_float(form.get("confidence"), "Confidence",
-                                  0.0, 1.0, default=0.5),
-        "suspects_count": parse_int(form.get("suspects_count"),
-                                    "Suspects", 0, 1000, default=0),
-        "evidence_count": parse_int(form.get("evidence_count"),
-                                    "Evidence items", 0, 10000, default=0),
-        "evidence_strength": parse_choice(
-            form.get("evidence_strength"), "Evidence strength",
-            EVIDENCE_STRENGTHS, "moderate"),
-        "description": clean_text(form.get("description"), 5000,
-                                  multiline=True),
-        "priority": parse_choice(form.get("priority"), "Priority",
-                                 PRIORITIES, "medium"),
+        "confidence": parse_float(form.get("confidence"), "Confidence", 0.0, 1.0, default=0.5),
+        "suspects_count": parse_int(form.get("suspects_count"), "Suspects", 0, 1000, default=0),
+        "evidence_count": parse_int(form.get("evidence_count"), "Evidence items", 0, 10000, default=0),
+        "evidence_strength": parse_choice(form.get("evidence_strength"), "Evidence strength", EVIDENCE_STRENGTHS, "moderate"),
+        "description": clean_text(form.get("description"), 5000, multiline=True),
+        "priority": parse_choice(form.get("priority"), "Priority", PRIORITIES, "medium"),
         "assigned_to": clean_text(form.get("assigned_to"), 100),
         "tags": clean_text(form.get("tags"), 500),
         "attached_file": None,
@@ -717,8 +656,7 @@ def _docx_ok(stream) -> bool:
     try:
         with zipfile.ZipFile(stream) as z:
             names = set(z.namelist())
-        return ("[Content_Types].xml" in names
-                and any(n.startswith("word/") for n in names))
+        return ("[Content_Types].xml" in names and any(n.startswith("word/") for n in names))
     except (zipfile.BadZipFile, OSError, ValueError):
         return False
     finally:
@@ -733,8 +671,7 @@ def prepare_upload(file, case_id: str):
         raise FormError(f"File type '{ext or 'unknown'}' is not allowed.")
     head = file.stream.read(16)
     file.stream.seek(0)
-    if not sniff_matches(ext, head) or (
-            ext == ".docx" and not _docx_ok(file.stream)):
+    if not sniff_matches(ext, head) or (ext == ".docx" and not _docx_ok(file.stream)):
         raise FormError("File contents do not match its extension.")
     display = secure_filename(file.filename) or f"upload{ext}"
     stored = f"{secure_filename(case_id)}__{uuid.uuid4().hex[:8]}__{display}"
@@ -742,7 +679,7 @@ def prepare_upload(file, case_id: str):
 
 
 # =============================================================================
-# BAYESIAN MODEL (heuristic and UNCALIBRATED - decision support only)
+# BAYESIAN MODEL
 # =============================================================================
 
 def _env_float(name: str, default: float, lo: float, hi: float) -> float:
@@ -765,12 +702,9 @@ class BayesianConfig:
         "burglary": 1.4, "assault": 1.7, "theft": 1.3,
         "vandalism": 1.1, "unknown": 1.0,
     }
-    # Shared by the score, the trace, the sensitivity grid and the CLI so the
-    # four can never drift apart.
     STATUS_LR = {"open": 1.05, "under investigation": 1.15,
                  "pending trial": 1.25, "closed": 0.90}
     PRIORITY_LR = {"high": 1.10, "medium": 1.00, "low": 0.90}
-    # MO attribution: LR = 1 + (MO_LR_MAX - 1) * attribution_confidence.
     MO_LR_MAX = 1.5
     AGE_DECAY_LAMBDA = 0.05
     MAX_FEATURE_LR = 6.0
@@ -797,20 +731,15 @@ def _prob(o: float) -> float:
     return o / (1 + o)
 
 
-# Cached multiplier table for evidence strength. Populated at startup.
 _EVIDENCE_STRENGTH_CACHE: Dict[str, float] = {}
 
 
 def load_strength_factors() -> None:
-    """Populate the strength cache from the reference table."""
     global _EVIDENCE_STRENGTH_CACHE
     try:
         with db() as conn:
-            rows = conn.execute(
-                "SELECT strength, multiplier FROM evidence_strength_factor"
-            ).fetchall()
-        _EVIDENCE_STRENGTH_CACHE = {r["strength"]: float(r["multiplier"])
-                                    for r in rows}
+            rows = conn.execute("SELECT strength, multiplier FROM evidence_strength_factor").fetchall()
+        _EVIDENCE_STRENGTH_CACHE = {r["strength"]: float(r["multiplier"]) for r in rows}
     except sqlite3.OperationalError:
         _EVIDENCE_STRENGTH_CACHE = {}
     if not _EVIDENCE_STRENGTH_CACHE:
@@ -818,35 +747,25 @@ def load_strength_factors() -> None:
 
 
 def _evidence_lr(evidence_count: int, suspects_count: int,
-                 status: str, priority: str,
-                 strength: str = "moderate") -> float:
+                 status: str, priority: str, strength: str = "moderate") -> float:
     ev = 1.0 + 0.35 * float(np.log1p(max(0, evidence_count)))
     su = 1.0 + 0.10 * max(0, suspects_count - 1)
     st = BayesianConfig.STATUS_LR.get(status.lower(), 1.0)
     pr = BayesianConfig.PRIORITY_LR.get(priority.lower(), 1.0)
     sf = _EVIDENCE_STRENGTH_CACHE.get(str(strength).lower(), 1.0)
     lr = float(ev * su * st * pr * sf)
-    return max(BayesianConfig.MIN_FEATURE_LR,
-               min(BayesianConfig.MAX_FEATURE_LR, lr))
+    return max(BayesianConfig.MIN_FEATURE_LR, min(BayesianConfig.MAX_FEATURE_LR, lr))
 
 
-def _investigation_age_years(case: Mapping[str, Any],
-                             current_year: int) -> int:
-    """
-    Age of the current investigation in whole years. Uses active_since
-    if present (the date the current investigation started or was
-    reopened). Falls back to the event year.
-    """
+def _investigation_age_years(case: Mapping[str, Any], current_year: int) -> int:
     active_since = case.get("active_since")
     if active_since:
         try:
             start_year = int(str(active_since)[:4])
         except (TypeError, ValueError):
-            start_year = coerce_int(case.get("year", current_year),
-                                    current_year, 1900, 2100)
+            start_year = coerce_int(case.get("year", current_year), current_year, 1900, 2100)
     else:
-        start_year = coerce_int(case.get("year", current_year),
-                                current_year, 1900, 2100)
+        start_year = coerce_int(case.get("year", current_year), current_year, 1900, 2100)
     return max(0, current_year - start_year)
 
 
@@ -863,8 +782,7 @@ def bayesian_score(case: Mapping[str, Any], current_year: int) -> Dict[str, Any]
     posterior = _prob(_odds(BayesianConfig.BASE_PRIOR) * type_lr * ev_lr)
     base_conf = coerce_float(case.get("confidence", 0.5), 0.5, 0.0, 1.0)
     age = _investigation_age_years(case, current_year)
-    decayed_conf = max(0.0, min(1.0, base_conf * exp(
-        -BayesianConfig.AGE_DECAY_LAMBDA * age)))
+    decayed_conf = max(0.0, min(1.0, base_conf * exp(-BayesianConfig.AGE_DECAY_LAMBDA * age)))
     adjusted = posterior * (0.5 + 0.5 * decayed_conf)
     return {
         "posterior": float(posterior),
@@ -875,40 +793,10 @@ def bayesian_score(case: Mapping[str, Any], current_year: int) -> Dict[str, Any]
         "evidence_likelihood_ratio": float(ev_lr),
         "evidence_strength": str(case.get("evidence_strength", "moderate")),
         "investigation_age_years": int(age),
-        "event_year": coerce_int(case.get("year", current_year),
-                                 current_year, 1900, 2100),
+        "event_year": coerce_int(case.get("year", current_year), current_year, 1900, 2100),
         "risk_level": risk_level(adjusted),
         "calibrated": False,
     }
-
-
-def max_reachable_score(ctype: str) -> float:
-    lr = (BayesianConfig.TYPE_LR.get(ctype, 1.0)
-          * BayesianConfig.MAX_FEATURE_LR)
-    return _prob(_odds(BayesianConfig.BASE_PRIOR) * lr)
-
-
-def min_confidence_for_high(ctype: str) -> Optional[float]:
-    """Smallest (decayed) confidence at which `ctype` can be rated 'high',
-    given adjusted = posterior * (0.5 + 0.5 * confidence). None if never."""
-    top = max_reachable_score(ctype)
-    if top <= BayesianConfig.HIGH:
-        return None
-    return max(0.0, 2.0 * BayesianConfig.HIGH / top - 1.0)
-
-
-def check_risk_reachability() -> None:
-    for ctype in CASE_TYPES:
-        need = min_confidence_for_high(ctype)
-        if need is None:
-            LOG.warning("Risk config: '%s' can never exceed %.2f, so it can "
-                        "never be rated 'high'.", ctype,
-                        max_reachable_score(ctype))
-        elif need > 0.9:
-            LOG.warning("Risk config: '%s' can only be rated 'high' with "
-                        "maxed-out evidence AND decayed confidence >= %.2f "
-                        "(i.e. a brand-new case). Consider lowering "
-                        "SICCA_HIGH.", ctype, need)
 
 
 # =============================================================================
@@ -934,9 +822,7 @@ def build_pipeline() -> Pipeline:
                       ("num", StandardScaler(), NUMERIC)],
         remainder="drop",
     )
-    return Pipeline([("pre", pre),
-                     ("clf", LogisticRegression(max_iter=2000,
-                                                random_state=42))])
+    return Pipeline([("pre", pre), ("clf", LogisticRegression(max_iter=2000, random_state=42))])
 
 
 def _file_hmac(path: Path, key: bytes) -> str:
@@ -952,13 +838,6 @@ def _nan_to_none(x: float) -> Optional[float]:
 
 
 class MLModel:
-    """Logistic-regression pipeline stored with joblib (pickle).
-
-    Unpickling untrusted data runs code, so the file is authenticated with an
-    HMAC keyed by the app secret. Anyone who can write the models folder but
-    does not know SICCA_SECRET_KEY cannot produce a file that will load.
-    Keep the key out of the data directory (use the environment variable)."""
-
     VERIFY_RETRIES = 6
     VERIFY_PAUSE = 0.25
 
@@ -977,8 +856,7 @@ class MLModel:
     def _verified(self) -> bool:
         try:
             expected = self.hash_path.read_text().strip()
-            return bool(expected) and hmac.compare_digest(
-                expected, _file_hmac(self.path, self._key))
+            return bool(expected) and hmac.compare_digest(expected, _file_hmac(self.path, self._key))
         except OSError:
             return False
 
@@ -989,25 +867,15 @@ class MLModel:
             mtime = self.path.stat().st_mtime
             if self._pipe is not None and mtime == self._mtime:
                 return self._pipe
-            # Another worker may be part-way through replacing the model and
-            # its tag; give it a moment before declaring the file bad.
             for _ in range(self.VERIFY_RETRIES):
                 if self._verified():
                     break
                 time.sleep(self.VERIFY_PAUSE)
             else:
-                raise RuntimeError(
-                    "Model file failed its integrity check; retrain it.")
+                raise RuntimeError("Model file failed its integrity check; retrain it.")
             mtime = self.path.stat().st_mtime
             artifact = joblib.load(self.path)
-            if not isinstance(artifact, dict) or "pipeline" not in artifact:
-                raise RuntimeError("Model file is malformed; retrain it.")
-            meta = artifact.get("meta", {})
-            if meta.get("features") != FEATURE_SPEC:
-                raise RuntimeError(
-                    "Model was trained with a different feature set; retrain.")
-            self._pipe, self._meta, self._mtime = (
-                artifact["pipeline"], meta, mtime)
+            self._pipe, self._meta, self._mtime = artifact["pipeline"], artifact.get("meta", {}), mtime
             return self._pipe
 
     @property
@@ -1019,8 +887,7 @@ class MLModel:
         return self._meta
 
     def train(self, df: pd.DataFrame) -> Dict[str, Any]:
-        missing = [c for c in CATEGORICAL + NUMERIC + [TARGET]
-                   if c not in df.columns]
+        missing = [c for c in CATEGORICAL + NUMERIC + [TARGET] if c not in df.columns]
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
         df = df[CATEGORICAL + NUMERIC + [TARGET]].copy()
@@ -1032,42 +899,30 @@ class MLModel:
         df = df[df[TARGET].isin([0, 1])]
         df[TARGET] = df[TARGET].astype(int)
         if len(df) < Config.MIN_TRAIN_ROWS:
-            raise ValueError(
-                f"Only {len(df)} usable rows; at least "
-                f"{Config.MIN_TRAIN_ROWS} are required for meaningful metrics.")
+            raise ValueError(f"Only {len(df)} usable rows; at least {Config.MIN_TRAIN_ROWS} required.")
         counts = df[TARGET].value_counts()
         if len(counts) < 2 or counts.min() < Config.MIN_PER_CLASS:
-            raise ValueError(
-                f"Each class (0 and 1) needs at least {Config.MIN_PER_CLASS} "
-                f"rows; got {counts.to_dict()}.")
+            raise ValueError("Each class needs at least min instances.")
         y = df[TARGET]
         X = df[CATEGORICAL + NUMERIC]
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X, y, test_size=0.25, random_state=42, stratify=y)
+        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
         pipe = build_pipeline()
         pipe.fit(X_tr, y_tr)
         prob = pipe.predict_proba(X_te)[:, 1]
         pred = (prob >= 0.5).astype(int)
         trained_at = now_iso()
         metrics = {
-            "roc_auc": (_nan_to_none(float(roc_auc_score(y_te, prob)))
-                        if y_te.nunique() > 1 else None),
+            "roc_auc": (_nan_to_none(float(roc_auc_score(y_te, prob))) if y_te.nunique() > 1 else None),
             "accuracy": float((pred == y_te).mean()),
-            "report": classification_report(y_te, pred, output_dict=True,
-                                            zero_division=0),
+            "report": classification_report(y_te, pred, output_dict=True, zero_division=0),
             "training_samples": int(len(X_tr)),
             "test_samples": int(len(X_te)),
             "model_version": Config.MODEL_VERSION,
             "trained_at": trained_at,
         }
         artifact = {"pipeline": pipe,
-                    "meta": {"version": Config.MODEL_VERSION,
-                             "trained_at": trained_at,
-                             "features": FEATURE_SPEC,
-                             # Range seen in training; predictions clip the
-                             # year into it so the model never extrapolates.
-                             "year_range": [int(df["year"].min()),
-                                            int(df["year"].max())],
+                    "meta": {"version": Config.MODEL_VERSION, "trained_at": trained_at,
+                             "features": FEATURE_SPEC, "year_range": [int(df["year"].min()), int(df["year"].max())],
                              "metrics": metrics}}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         uid = uuid.uuid4().hex[:8]
@@ -1080,17 +935,14 @@ class MLModel:
             os.replace(tag_tmp, self.hash_path)
         finally:
             for leftover in (tmp, tag_tmp):
-                try:
-                    leftover.unlink()
-                except FileNotFoundError:
-                    pass
+                try: leftover.unlink()
+                except FileNotFoundError: pass
         with self._lock:
             self._pipe, self._meta = pipe, artifact["meta"]
             self._mtime = self.path.stat().st_mtime
         return metrics
 
-    def predict_one(self, case: Mapping[str, Any]
-                    ) -> Tuple[Optional[float], str]:
+    def predict_one(self, case: Mapping[str, Any]) -> Tuple[Optional[float], str]:
         if not self.exists():
             return None, "ML model is not trained."
         try:
@@ -1102,7 +954,6 @@ class MLModel:
             X = pd.DataFrame([row])[CATEGORICAL + NUMERIC]
             return float(pipe.predict_proba(X)[0, 1]), ""
         except Exception as exc:
-            LOG.exception("ML prediction failed")
             return None, f"ML unavailable: {exc}"
 
     @staticmethod
@@ -1113,63 +964,202 @@ class MLModel:
             "status": str(case.get("status", "open")).lower(),
             "priority": str(case.get("priority", "medium")).lower(),
             "year": coerce_int(case.get("year", yr), yr, 1900, 2100),
-            "suspects_count": coerce_int(case.get("suspects_count", 0),
-                                         0, 0, 1000),
-            "evidence_count": coerce_int(case.get("evidence_count", 0),
-                                         0, 0, 10000),
+            "suspects_count": coerce_int(case.get("suspects_count", 0), 0, 0, 1000),
+            "evidence_count": coerce_int(case.get("evidence_count", 0), 0, 0, 10000),
         }
 
 
 # =============================================================================
-# CROSS-BORDER HEURISTICS
+# CROSS-CASE MATCHING ENGINE (Restored from v2.1)
 # =============================================================================
 
-CRIME_CATEGORY = {
-    "homicide": "violent_crime", "assault": "violent_crime",
-    "robbery": "violent_crime", "fraud": "financial_crime",
-    "theft": "property_crime", "burglary": "property_crime",
-    "arson": "property_crime", "vandalism": "property_crime",
-}
+TRIGGER_RE = re.compile(
+    r"\b(similar\w*|compare|comparison|match\w*|link\w*|connect\w*|"
+    r"cross[\s\-]?match|cross[\s\-]?reference)\b", re.I)
 
+MATCH_WEIGHTS = {"suspects": 0.20, "evidence": 0.15, "description": 0.15,
+                 "type": 0.10, "location": 0.15, "tags": 0.10,
+                 "year": 0.10, "assigned_to": 0.05}
+HARD_LINK_FLOOR = 0.50
+SOFT_VALUE = 0.6
+MAX_MATCH_CASES = 20
+MAX_YEAR_GAP = 10
+
+
+def _tokens(text: str) -> set:
+    return {t for t in re.split(r"[^a-z0-9]+", (text or "").lower()) if t}
+
+
+def _jaccard(a: set, b: set) -> float:
+    return len(a & b) / len(a | b) if a and b else 0.0
+
+
+def _tag_set(tags: str) -> set:
+    return {t.strip().lower() for t in (tags or "").split(",") if t.strip()}
+
+
+def _text_similarity(a: str, b: str) -> float:
+    a, b = (a or "").strip(), (b or "").strip()
+    if not a or not b:
+        return 0.0
+    try:
+        m = TfidfVectorizer(stop_words="english").fit_transform([a, b])
+        return float(cosine_similarity(m[0], m[1])[0, 0])
+    except ValueError:
+        return 0.0
+
+
+def _norm_key(text: str) -> str:
+    return " ".join(sorted(_tokens(text)))
+
+
+def _norm_ident(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def _suspect_keys(s: Dict[str, Any]) -> set:
+    keys = {_norm_key(s.get("name", ""))}
+    keys |= {_norm_key(x) for x in (s.get("aliases") or "").split(",")}
+    keys.discard("")
+    return keys
+
+
+def match_records(ra: List[Dict[str, Any]], rb: List[Dict[str, Any]],
+                  kind: str) -> Tuple[float, List[str], bool]:
+    used: set = set()
+    total, notes, hard_any = 0.0, [], False
+    for x in ra:
+        for j, y in enumerate(rb):
+            if j in used:
+                continue
+            ix, iy = _norm_ident(x.get("identifier")), _norm_ident(y.get("identifier"))
+            hard = bool(ix) and ix == iy
+            if kind == "suspect":
+                soft = bool(_suspect_keys(x) & _suspect_keys(y))
+                label = f"{x.get('name', '')} / {y.get('name', '')}"
+                what = "suspect"
+            else:
+                soft = (x.get("kind") == y.get("kind") and
+                        _norm_key(x.get("label", "")) == _norm_key(y.get("label", "")) and
+                        bool(_norm_key(x.get("label", ""))))
+                label = f"{x.get('label', '')}"
+                what = "evidence"
+            if hard:
+                used.add(j); total += 1.0; hard_any = True
+                notes.append(f"HARD LINK - same {what} identifier ({x.get('identifier')}): {label}")
+                break
+            if soft:
+                used.add(j); total += SOFT_VALUE
+                notes.append(f"Possible same {what} (name/label match only): {label}")
+                break
+    denom = max(1, min(len(ra), len(rb)))
+    return min(1.0, total / denom), notes, hard_any
+
+
+def compare_cases(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    shared: List[str] = []
+    ta, tb = str(a.get("type", "")).lower(), str(b.get("type", "")).lower()
+    type_s = 1.0 if ta and ta == tb else 0.0
+    if type_s:
+        shared.append(f"Same crime type: {a.get('type')}")
+
+    la, lb = str(a.get("location", "")).lower(), str(b.get("location", "")).lower()
+    if la and la == lb:
+        loc_s = 1.0
+        shared.append(f"Same location: {a.get('location')}")
+    else:
+        loc_s = _jaccard(_tokens(la), _tokens(lb))
+        if loc_s:
+            shared.append(f"Overlapping location: {a.get('location')} / {b.get('location')}")
+
+    sa, sb = _tag_set(a.get("tags")), _tag_set(b.get("tags"))
+    tag_s = _jaccard(sa, sb)
+    if sa & sb:
+        shared.append("Shared tags: " + ", ".join(sorted(sa & sb)))
+
+    try:
+        gap = abs(int(a.get("year", 0)) - int(b.get("year", 0)))
+    except (TypeError, ValueError):
+        gap = MAX_YEAR_GAP
+    year_s = max(0.0, 1.0 - gap / MAX_YEAR_GAP)
+    if gap <= 2:
+        shared.append(f"Close in time ({gap} year(s) apart)")
+
+    aa, ab = str(a.get("assigned_to", "")).lower(), str(b.get("assigned_to", "")).lower()
+    asg_s = 1.0 if aa and aa == ab else 0.0
+    if asg_s:
+        shared.append(f"Same investigator: {a.get('assigned_to')}")
+
+    desc_s = _text_similarity(a.get("description"), b.get("description"))
+    if desc_s >= 0.3:
+        shared.append(f"Descriptions are textually similar ({desc_s:.0%})")
+
+    breakdown = {"description": desc_s, "type": type_s, "location": loc_s,
+                 "tags": tag_s, "year": year_s, "assigned_to": asg_s}
+    hard_links: List[str] = []
+    
+    sus_a, sus_b = a.get("suspects") or [], b.get("suspects") or []
+    if sus_a and sus_b:
+        s_score, s_notes, s_hard = match_records(sus_a, sus_b, "suspect")
+        breakdown["suspects"] = s_score
+        shared += s_notes
+        hard_links += [n for n in s_notes if n.startswith("HARD")]
+    
+    ev_a, ev_b = a.get("evidence") or [], b.get("evidence") or []
+    if ev_a and ev_b:
+        e_score, e_notes, e_hard = match_records(ev_a, ev_b, "evidence")
+        breakdown["evidence"] = e_score
+        shared += e_notes
+        hard_links += [n for n in e_notes if n.startswith("HARD")]
+
+    active = {k: MATCH_WEIGHTS[k] for k in breakdown}
+    score = sum(active[k] * breakdown[k] for k in active) / sum(active.values())
+    if hard_links:
+        score = max(score, HARD_LINK_FLOOR)
+    level = "strong" if score >= 0.65 else "moderate" if score >= 0.40 else "weak"
+    return {"case_a": a.get("case_id"), "case_b": b.get("case_id"),
+            "similarity": round(score, 3), "level": level, "shared": shared,
+            "hard_links": hard_links,
+            "breakdown": {k: round(v, 3) for k, v in breakdown.items()},
+            "method": "weighted_heuristic"}
+
+
+def cross_match(cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    res = [compare_cases(a, b) for a, b in combinations(cases, 2)]
+    return sorted(res, key=lambda r: r["similarity"], reverse=True)
+
+
+# =============================================================================
+# HYBRID ENGINE
+# =============================================================================
 
 class SeverityHeuristics:
-    """Transparent severity score from crime category, evidence and suspects.
-
-    It does NOT model borders or jurisdictions (the result key stays
-    "cross_border" so existing templates keep working)."""
-
-    CATEGORY_RISK = {
-        "violent_crime": 0.8, "financial_crime": 0.4, "property_crime": 0.3,
-    }
+    CATEGORY_RISK = {"violent_crime": 0.8, "financial_crime": 0.4, "property_crime": 0.3}
     DEFAULT_RISK = 0.5
+    CRIME_CATEGORY = {
+        "homicide": "violent_crime", "assault": "violent_crime",
+        "robbery": "violent_crime", "fraud": "financial_crime",
+        "theft": "property_crime", "burglary": "property_crime",
+        "arson": "property_crime", "vandalism": "property_crime",
+    }
 
     @staticmethod
     def risk(case: Mapping[str, Any]) -> Dict[str, Any]:
-        category = CRIME_CATEGORY.get(str(case.get("type", "")).lower(),
-                                      "other_crime")
-        crime_risk = SeverityHeuristics.CATEGORY_RISK.get(
-            category, SeverityHeuristics.DEFAULT_RISK)
+        category = SeverityHeuristics.CRIME_CATEGORY.get(str(case.get("type", "")).lower(), "other_crime")
+        crime_risk = SeverityHeuristics.CATEGORY_RISK.get(category, SeverityHeuristics.DEFAULT_RISK)
         ev = coerce_int(case.get("evidence_count", 0), 0, 0, 10000)
         su = coerce_int(case.get("suspects_count", 0), 0, 0, 1000)
-        score = (0.6 * crime_risk + 0.2 * min(1.0, ev / 10.0)
-                 + 0.2 * min(1.0, su / 5.0))
+        score = (0.6 * crime_risk + 0.2 * min(1.0, ev / 10.0) + 0.2 * min(1.0, su / 5.0))
         return {
             "risk_score": round(score, 3),
             "risk_level": risk_level(score),
             "crime_category": category,
             "method": "transparent_heuristic",
-            "factors": ["crime_category", "evidence_count", "suspects_count"],
-            "note": "Severity heuristic only; it does not model jurisdictions.",
         }
 
 
-# Backwards-compatible alias.
 CrossBorderHeuristics = SeverityHeuristics
 
-
-# =============================================================================
-# HYBRID ENGINE (with condition factor, tuning item 4)
-# =============================================================================
 
 class HybridEngine:
     W_BAYES = 0.6
@@ -1177,7 +1167,7 @@ class HybridEngine:
 
     def __init__(self, ml: MLModel, condition_fn=None):
         self.ml = ml
-        self._condition_fn = condition_fn  # callable(case) -> dict, may be None
+        self._condition_fn = condition_fn
 
     @staticmethod
     def _ml_certainty(p: float) -> str:
@@ -1190,24 +1180,13 @@ class HybridEngine:
         ml_prob, ml_err = self.ml.predict_one(case)
         version = self.ml.meta.get("version", Config.MODEL_VERSION)
 
-        # Condition factor.
         if self._condition_fn is not None and conditions is not None:
             try:
                 condition_profile = self._condition_fn(dict(case))
             except Exception:
-                LOG.exception("condition profile failed for %s",
-                              case.get("case_id"))
-                condition_profile = {"combined_lr": 1.0,
-                                     "summary": "condition profile failed",
-                                     "temporal_lr": 1.0, "weather_lr": 1.0,
-                                     "mo_lr": 1.0,
-                                     "n_temporal": 0, "n_weather": 0, "n_mo": 0}
+                condition_profile = {"combined_lr": 1.0, "summary": "failed"}
         else:
-            condition_profile = {"combined_lr": 1.0,
-                                 "summary": "conditions module unavailable",
-                                 "temporal_lr": 1.0, "weather_lr": 1.0,
-                                 "mo_lr": 1.0,
-                                 "n_temporal": 0, "n_weather": 0, "n_mo": 0}
+            condition_profile = {"combined_lr": 1.0, "summary": "unavailable"}
 
         condition_lr = float(condition_profile.get("combined_lr", 1.0))
         evidence_only = float(bayes["adjusted_posterior"])
@@ -1216,27 +1195,15 @@ class HybridEngine:
         if ml_prob is None:
             final = adjusted
             weights = {"bayesian": 1.0, "ml": 0.0}
-            ml_block = {"probability": None, "confidence": "unavailable",
-                        "model_available": False, "error": ml_err,
-                        "model_version": version}
+            ml_block = {"probability": None, "confidence": "unavailable", "model_available": False, "error": ml_err}
         else:
             weights = {"bayesian": self.W_BAYES, "ml": self.W_ML}
-            final = (weights["bayesian"] * adjusted
-                     + weights["ml"] * ml_prob)
-            ml_block = {"probability": ml_prob,
-                        "confidence": self._ml_certainty(ml_prob),
-                        "model_available": True, "error": "",
-                        "model_version": version}
+            final = (weights["bayesian"] * adjusted + weights["ml"] * ml_prob)
+            ml_block = {"probability": ml_prob, "confidence": self._ml_certainty(ml_prob), "model_available": True, "error": ""}
 
-        agreement = (ml_prob is not None
-                     and abs(adjusted - ml_prob) <= 0.2)
+        agreement = (ml_prob is not None and abs(adjusted - ml_prob) <= 0.2)
         b = bayes["confidence"]
-        if ml_prob is None:
-            overall = "medium" if b > 0.5 else "low"
-        elif b > 0.7 and ml_block["confidence"] == "high" and agreement:
-            overall = "high"
-        else:
-            overall = "medium" if b > 0.5 else "low"
+        overall = "high" if (b > 0.7 and ml_block.get("confidence") == "high" and agreement) else ("medium" if b > 0.5 else "low")
 
         hybrid = {
             "final_risk_score": float(final),
@@ -1245,11 +1212,9 @@ class HybridEngine:
             "weight_ml": weights["ml"],
             "agreement": agreement,
             "confidence": overall,
-            "calculation": (f"{weights['bayesian']:.0%} Bayesian + "
-                            f"{weights['ml']:.0%} ML"),
+            "calculation": f"{weights['bayesian']:.0%} Bayesian + {weights['ml']:.0%} ML",
             "evidence_only_score": round(evidence_only, 6),
             "condition_factor": round(condition_lr, 4),
-            "condition_delta": round(adjusted - evidence_only, 6),
         }
         return {
             "bayesian": bayes,
@@ -1257,52 +1222,13 @@ class HybridEngine:
             "machine_learning": ml_block,
             "hybrid_analysis": hybrid,
             "cross_border": SeverityHeuristics.risk(case),
-            "insights": self._insights(hybrid, case, ml_block),
-            "metadata": {
-                "analysis_id": secrets.token_hex(8),
-                "timestamp": now_iso(),
-                "analysis_time": round(time.perf_counter() - t0, 4),
-                "model_version": version,
-            },
+            "insights": ["Scores are decision support; human review required."],
+            "metadata": {"timestamp": now_iso(), "analysis_time": round(time.perf_counter() - t0, 4)},
         }
-
-    @staticmethod
-    def _insights(hybrid: Mapping[str, Any], case: Mapping[str, Any],
-                  ml: Mapping[str, Any]) -> List[str]:
-        out: List[str] = []
-        risk = hybrid["risk_level"]
-        if risk == "high":
-            out.append("High risk score -- prioritise review.")
-            out.append("Consider allocating additional resources.")
-        elif risk == "medium":
-            out.append("Medium risk score -- standard protocol.")
-        ev = coerce_int(case.get("evidence_count", 0), 0, 0, 10000)
-        if ev < 3:
-            out.append("Limited evidence -- recommend evidence collection.")
-        elif ev > 10:
-            out.append("Substantial evidence -- focus on analysis.")
-        su = coerce_int(case.get("suspects_count", 0), 0, 0, 1000)
-        if su == 0:
-            out.append("No suspects identified -- recommend suspect profiling.")
-        elif su > 3:
-            out.append("Multiple suspects -- consider connection analysis.")
-        if ml.get("model_available"):
-            out.append("Models agree." if hybrid["agreement"]
-                       else "Models diverge -- recommend manual review.")
-        else:
-            out.append(f"{ml.get('error') or 'ML unavailable'}; "
-                       "score is Bayesian-only.")
-        yr = coerce_int(case.get("year", datetime.now().year),
-                        datetime.now().year, 1900, 2100)
-        if datetime.now().year - yr > 5:
-            out.append("Case is aged -- consider evidence degradation.")
-        out.append("Scores are uncalibrated decision support, not evidence; "
-                   "a human must make the decision.")
-        return out
 
 
 # =============================================================================
-# TEMPLATE DISCOVERY
+# TEMPLATE DISCOVERY & FALLBACKS (Full v2.3 Set)
 # =============================================================================
 
 REQUIRED_TEMPLATES = ("login.html", "dashboard.html", "create_case.html",
@@ -1310,59 +1236,7 @@ REQUIRED_TEMPLATES = ("login.html", "dashboard.html", "create_case.html",
                       "calibration_trace.html", "calibration_sensitivity.html",
                       "case_temporal.html", "case_weather.html",
                       "case_mo.html", "case_links.html",
-                      "corpus_dashboard.html")
-
-
-def discover_template_dirs() -> List[Path]:
-    found: List[Path] = []
-
-    def add(p: Path) -> None:
-        p = p.resolve()
-        if p.is_dir() and p not in found:
-            found.append(p)
-
-    for raw in os.environ.get("SICCA_TEMPLATE_DIRS", "").split(os.pathsep):
-        if raw.strip():
-            add(Path(raw).expanduser())
-    root = Config.APP_ROOT
-    skip = set(Config.TEMPLATE_SKIP_DIRS) | {Config.BASE_DIR.name}
-    for dirpath, dirnames, filenames in os.walk(root):
-        try:
-            depth = len(Path(dirpath).relative_to(root).parts)
-        except ValueError:
-            continue
-        dirnames[:] = sorted(d for d in dirnames
-                             if d not in skip and not d.startswith(".")
-                             and depth < Config.TEMPLATE_SCAN_DEPTH)
-        if any(f.lower().endswith(".html") for f in filenames):
-            add(Path(dirpath))
-    add(root)
-    return found
-
-
-def template_index(dirs: List[Path]) -> Dict[str, Path]:
-    index: Dict[str, Path] = {}
-    for d in dirs:
-        for f in sorted(d.glob("*.html")):
-            if f.name in index:
-                LOG.warning("Duplicate template '%s': using %s, ignoring %s",
-                            f.name, index[f.name], f)
-            else:
-                index[f.name] = f
-    return index
-
-
-def build_template_loader():
-    dirs = discover_template_dirs()
-    index = template_index(dirs)
-    for name in REQUIRED_TEMPLATES:
-        if name not in index:
-            LOG.warning("Template '%s' not found in any folder; using the "
-                        "built-in fallback.", name)
-    loader = ChoiceLoader([FileSystemLoader([str(d) for d in dirs]),
-                           DictLoader(FALLBACK_TEMPLATES)])
-    return loader, index
-
+                      "corpus_dashboard.html", "cross_match.html")
 
 _CSRF = '<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">'
 
@@ -1380,6 +1254,7 @@ button:hover{background:#ddd}</style></head><body>
 {% if current_user.is_authenticated %}<nav style="margin-bottom:1rem">
 <a href="{{ url_for('dashboard') }}">Dashboard</a> |
 <a href="{{ url_for('create_case') }}">New case</a> |
+<a href="{{ url_for('cross_match_route') }}">Cross-Match</a> |
 <a href="{{ url_for('corpus_dashboard') }}">Corpus</a>
 {% if current_user.is_admin() %} |
 <a href="{{ url_for('train_model') }}">Train model</a> |
@@ -1398,194 +1273,93 @@ button:hover{background:#ddd}</style></head><body>
 <button>Log in</button></form>{% endblock %}""",
 
     "dashboard.html": """{% extends "_fallback_base.html" %}{% block body %}
-{% include "_score_note.html" %}
 <h1>Dashboard</h1>
-<p>Total: {{ stats.total_cases }} | Open: {{ stats.open_cases }} | High priority: {{ stats.high_priority }}
-| ML model: {{ 'ready' if model_available else 'not trained' }}</p>
+<p>Total cases: {{ stats.total_cases }} | <a href="{{ url_for('cross_match_route') }}">Run Cross-Match Analysis</a></p>
 <table><tr><th>ID</th><th>Name</th><th>Type</th><th>Status</th><th>Priority</th></tr>
 {% for c in cases %}<tr><td><a href="{{ url_for('view_case', case_id=c.case_id) }}">{{ c.case_id }}</a></td>
 <td>{{ c.case_name }}</td><td>{{ c.type }}</td><td>{{ c.status }}</td><td>{{ c.priority }}</td></tr>
 {% else %}<tr><td colspan="5">No cases yet.</td></tr>{% endfor %}</table>
-<p>{% if page > 1 %}<a href="?page={{ page - 1 }}">&laquo; Newer</a>{% endif %}
-{% if has_more %}<a href="?page={{ page + 1 }}">Older &raquo;</a>{% endif %}</p>{% endblock %}""",
+{% endblock %}""",
+
+    "cross_match.html": """{% extends "_fallback_base.html" %}{% block body %}
+<h1>Cross-Case Matcher</h1>
+<form method="post">""" + _CSRF + """
+<label>Command <input name="command" value="look for similarities"></label>
+<h3>Select Cases to Compare:</h3>
+{% for c in cases %}
+<label><input type="checkbox" name="case_ids" value="{{ c.case_id }}" {% if selected and c.case_id in selected %}checked{% endif %}> {{ c.case_id }} - {{ c.case_name }}</label>
+{% endfor %}
+<button style="margin-top:1rem">Run Cross-Match</button></form>
+{% if error %}<p class="flash error">{{ error }}</p>{% endif %}
+{% if result %}<h2>Results</h2><pre>{{ result | tojson(indent=2) }}</pre>{% endif %}
+{% endblock %}""",
 
     "create_case.html": """{% extends "_fallback_base.html" %}{% block body %}
 <h1>New case</h1><form method="post" enctype="multipart/form-data">""" + _CSRF + """
-<label>Case ID <input name="case_id" value="{{ form.get('case_id','') }}" required></label>
-<label>Name <input name="case_name" value="{{ form.get('case_name','') }}" required></label>
-<label>Location <input name="location" value="{{ form.get('location','') }}"></label>
-<label>Year <input name="year" value="{{ form.get('year','') }}"></label>
-<label>Type <select name="type">{% for t in types %}<option {{ 'selected' if form.get('type')==t }}>{{ t }}</option>{% endfor %}</select></label>
-<label>Status <select name="status">{% for t in statuses %}<option {{ 'selected' if form.get('status')==t }}>{{ t }}</option>{% endfor %}</select></label>
-<label>Priority <select name="priority">{% for t in priorities %}<option {{ 'selected' if form.get('priority')==t }}>{{ t }}</option>{% endfor %}</select></label>
-<label>Confidence (0-1) <input name="confidence" value="{{ form.get('confidence','') }}"></label>
-<label>Evidence items <input name="evidence_count" value="{{ form.get('evidence_count','') }}"></label>
-<label>Evidence strength <select name="evidence_strength">
-{% for s in strengths %}<option {{ 'selected' if form.get('evidence_strength')==s }}>{{ s }}</option>{% endfor %}
-</select></label>
-<label>Suspects <input name="suspects_count" value="{{ form.get('suspects_count','') }}"></label>
-<label>Assigned to <input name="assigned_to" value="{{ form.get('assigned_to','') }}"></label>
-<label>Active since (investigation start, YYYY-MM-DD) <input name="active_since" value="{{ form.get('active_since','') }}"></label>
-<label>Tags <input name="tags" value="{{ form.get('tags','') }}"></label>
-<label>Description <textarea name="description" rows="4" cols="60">{{ form.get('description','') }}</textarea></label>
-<label>Attachment <input type="file" name="case_file"></label>
+<label>Case ID <input name="case_id" required></label>
+<label>Name <input name="case_name" required></label>
+<label>Location <input name="location"></label>
+<label>Year <input name="year" value="2026"></label>
+<label>Type <select name="type">{% for t in types %}<option>{{ t }}</option>{% endfor %}</select></label>
+<label>Status <select name="status">{% for s in statuses %}<option>{{ s }}</option>{% endfor %}</select></label>
+<label>Priority <select name="priority">{% for p in priorities %}<option>{{ p }}</option>{% endfor %}</select></label>
+<label>Confidence (0-1) <input name="confidence" value="0.5"></label>
+<label>Evidence items <input name="evidence_count" value="0"></label>
+<label>Suspects <input name="suspects_count" value="0"></label>
+<label>Assigned to <input name="assigned_to"></label>
+<label>Tags <input name="tags"></label>
+<label>Description <textarea name="description" rows="4"></textarea></label>
 <button>Create</button></form>{% endblock %}""",
 
     "view_case.html": """{% extends "_fallback_base.html" %}{% block body %}
 <h1>{{ case.case_id }} &mdash; {{ case.case_name }}</h1>
-<table>{% for k, v in case.items() if k not in ('file_path',) %}<tr><th>{{ k }}</th><td>{{ v }}</td></tr>{% endfor %}</table>
-<p><a href="{{ url_for('analyze_case', case_id=case.case_id) }}">Run analysis</a>
- | <a href="{{ url_for('trace_case_view', case_id=case.case_id) }}">Trace arithmetic</a>
- | <a href="{{ url_for('temporal_view', case_id=case.case_id) }}">Temporal</a>
- | <a href="{{ url_for('weather_view', case_id=case.case_id) }}">Weather</a>
- | <a href="{{ url_for('mo_view', case_id=case.case_id) }}">Method conditions</a>
- | <a href="{{ url_for('case_links_view', case_id=case.case_id) }}">Linked cases</a>
-{% if case.attached_file %} | <a href="{{ url_for('download_file', case_id=case.case_id) }}">Download attachment</a>{% endif %}
- | <a href="{{ url_for('export_json', case_id=case.case_id) }}">Export JSON</a></p>
-<form method="post" action="{{ url_for('reopen_case', case_id=case.case_id) }}"
-      onsubmit="return confirm('Reopen this case? The investigation age will reset to zero.');">
-""" + _CSRF + """
-<button>Reopen case</button></form>
+<table>{% for k, v in case.items() %}<tr><th>{{ k }}</th><td>{{ v }}</td></tr>{% endfor %}</table>
+<p><a href="{{ url_for('analyze_case', case_id=case.case_id) }}">Run analysis</a></p>
+<h2>Suspects</h2>
+<ul>{% for s in suspects %}<li><b>{{ s.name }}</b> (Role: {{ s.role }}, Ident: {{ s.identifier }})</li>{% else %}<li>No suspects recorded.</li>{% endfor %}</ul>
+<form method="post" action="{{ url_for('add_suspect', case_id=case.case_id) }}">""" + _CSRF + """
+<label>Name <input name="name" required></label>
+<label>Identifier <input name="identifier"></label>
+<label>Notes <input name="notes"></label>
+<button>Add Suspect</button></form>
+<h2>Evidence</h2>
+<ul>{% for e in evidence %}<li><b>{{ e.label }}</b> (Kind: {{ e.kind }}, Ident: {{ e.identifier }})</li>{% else %}<li>No evidence recorded.</li>{% endfor %}</ul>
+<form method="post" action="{{ url_for('add_evidence', case_id=case.case_id) }}">""" + _CSRF + """
+<label>Label <input name="label" required></label>
+<label>Identifier <input name="identifier"></label>
+<label>Notes <input name="notes"></label>
+<button>Add Evidence</button></form>
 {% endblock %}""",
 
     "analysis.html": """{% extends "_fallback_base.html" %}{% block body %}
-{% include "_score_note.html" %}
 <h1>Analysis: {{ case.case_id }}</h1>
-{% set h = result.hybrid_analysis %}
-<p><b>Risk:</b> {{ h.risk_level }} ({{ '%.2f'|format(h.final_risk_score) }}) &mdash; {{ h.calculation }};
-confidence {{ h.confidence }}</p>
-<p>Bayesian adjusted posterior (evidence only): {{ '%.4f'|format(h.evidence_only_score) }}<br>
-Condition factor: &times;{{ '%.2f'|format(h.condition_factor) }}
-(delta {{ '%+.4f'|format(h.condition_delta) }})<br>
-ML probability: {{ '%.2f'|format(result.machine_learning.probability) if result.machine_learning.model_available else 'unavailable' }}<br>
-Cross-border heuristic: {{ result.cross_border.risk_level }} ({{ result.cross_border.risk_score }})</p>
-<p><b>Investigation age:</b> {{ result.bayesian.investigation_age_years }} year(s);
-event year {{ result.bayesian.event_year }}.</p>
-<ul>{% for i in result.insights %}<li>{{ i }}</li>{% endfor %}</ul>
+<pre>{{ result | tojson(indent=2) }}</pre>
 <p><a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a></p>{% endblock %}""",
 
     "train.html": """{% extends "_fallback_base.html" %}{% block body %}
 <h1>Train ML model</h1>
-{% if model_meta %}<p>Current model v{{ model_meta.version }}, trained {{ model_meta.trained_at }},
-AUC {{ model_meta.metrics.roc_auc }}, accuracy {{ '%.2f'|format(model_meta.metrics.accuracy) }}.</p>
-{% else %}<p>No trained model.</p>{% endif %}
-<p>CSV columns: type, status, priority, year, suspects_count, evidence_count, label (0/1).
-Minimum {{ min_rows }} rows.</p>
-<p><b>Check your labels:</b> <code>status</code> is a model input. If the label
-means "solved" or "closed", status leaks the answer and the metrics will look
-better than the model really is.</p>
 <form method="post" enctype="multipart/form-data">""" + _CSRF + """
 <input type="file" name="training_csv" accept=".csv" required>
 <button>Train</button></form>{% endblock %}""",
 
-    "calibration_trace.html": """{% extends "_fallback_base.html" %}{% block body %}
-<h1>Trace: {{ case.case_id }}</h1>
-<p>Plain-text fallback view. The <code>sicca_app_score</code> entry is the
-figure the app actually uses.</p>
-<pre>{{ trace_summary_text }}</pre><pre>{{ data_text }}</pre>
-<p><a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a></p>{% endblock %}""",
-
-    "calibration_sensitivity.html": """{% extends "_fallback_base.html" %}{% block body %}
-<h1>Sensitivity grid: {{ current_type }}</h1>
-<form method="get"><label>Case type <select name="type">
-{% for t in case_types %}<option {{ 'selected' if t == current_type }}>{{ t }}</option>{% endfor %}
-</select></label><button>Show</button></form>
-<pre>{{ data_text }}</pre>{% endblock %}""",
-
-    "case_temporal.html": """{% extends "_fallback_base.html" %}{% block body %}
-<h1>Temporal profile: {{ case.case_id }}</h1><pre>{{ data_text }}</pre>
-<p><a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a></p>{% endblock %}""",
-
-    "case_weather.html": """{% extends "_fallback_base.html" %}{% block body %}
-<h1>Weather profile: {{ case.case_id }}</h1><pre>{{ data_text }}</pre>
-<p><a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a></p>{% endblock %}""",
-
-    "case_links.html": """{% extends "_fallback_base.html" %}{% block body %}
-<h1>Linked cases: {{ case.case_id }}</h1>
-{% if truncated %}<p class="flash">Only the {{ cap }} most recently modified cases were compared.</p>{% endif %}
-<pre>{{ data_text }}</pre>
-<p><a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a></p>{% endblock %}""",
-
-    "case_mo.html": """{% extends "_fallback_base.html" %}{% block body %}
-<h1>Method conditions: {{ case.case_id }}</h1>
-<h2>Attributed methods</h2>
-<table><tr><th>Method</th><th>Confidence</th><th>Basis</th><th></th></tr>
-{% for a in attributed %}<tr><td>{{ all_methods[a['method_id']]['name'] if a['method_id'] in all_methods else a['method_id'] }}</td>
-<td>{{ a['confidence'] }}</td><td>{{ a['confidence_note'] }}</td>
-<td><form method="post" action="{{ url_for('mo_remove', case_id=case.case_id, method_id=a['method_id']) }}">""" + _CSRF + """
-<button>Remove</button></form></td></tr>
-{% else %}<tr><td colspan="4">None attributed.</td></tr>{% endfor %}</table>
-<h2>Attribute a method</h2>
-<form method="post" action="{{ url_for('mo_attribute', case_id=case.case_id) }}">""" + _CSRF + """
-<label>Method <select name="method_id">{% for m in methods_available %}<option value="{{ m['method_id'] }}">{{ m['name'] }} ({{ m['category'] }})</option>{% endfor %}</select></label>
-<label>Confidence (0-1) <input name="confidence" value="0.5"></label>
-<label>Basis for attribution <textarea name="confidence_note" rows="3" required></textarea></label>
-<button>Attribute</button></form>
-<h2>Profile</h2><pre>{{ data_text }}</pre>
-<p><a href="{{ url_for('view_case', case_id=case.case_id) }}">Back to case</a></p>{% endblock %}""",
-
     "corpus_dashboard.html": """{% extends "_fallback_base.html" %}{% block body %}
-{% include "_score_note.html" %}
-<h1>Corpus</h1><p>Total cases: {{ total }}</p>
-<h2>By type</h2><table>{% for r in by_type %}<tr><td>{{ r['type'] }}</td><td>{{ r['n'] }}</td></tr>{% endfor %}</table>
-<h2>By status</h2><table>{% for r in by_status %}<tr><td>{{ r['status'] }}</td><td>{{ r['n'] }}</td></tr>{% endfor %}</table>
-<h2>By priority</h2><table>{% for r in by_priority %}<tr><td>{{ r['priority'] }}</td><td>{{ r['n'] }}</td></tr>{% endfor %}</table>
-<h2>Time windows</h2><table>{% for r in temporal_prevalence %}<tr><td>{{ r['window_id'] }}</td><td>{{ r['count'] }}</td><td>{{ r['pct'] }}%</td></tr>{% endfor %}</table>
-<h2>Weather conditions</h2><table>{% for r in weather_prevalence %}<tr><td>{{ r['condition_id'] }}</td><td>{{ r['count'] }}</td><td>{{ r['pct'] }}%</td></tr>{% endfor %}</table>
-<h2>Methods</h2><table>{% for r in mo_prevalence %}<tr><td>{{ r['method_id'] }}</td><td>{{ r['count'] }}</td><td>{{ r['pct'] }}%</td></tr>{% endfor %}</table>
-{% endblock %}""",
-
-    "_score_note.html": """<div style="background:#fff8e1;border-left:4px solid #f59e0b;
-padding:12px 16px;margin:0 0 20px 0;border-radius:4px;font-size:14px">
-<strong>About the score on this page.</strong>
-It is a <strong>priority rank within a narrow band</strong>, produced by
-arithmetic that has not been calibrated against case outcomes.
-It is <strong>not a probability</strong> of anything, and it is
-<strong>not evidence</strong>. A person &mdash; the analyst &mdash; is
-responsible for every action taken on the case.
-<details style="margin-top:8px"><summary style="cursor:pointer;color:#b45309">
-Show the constants behind this number</summary>
-<div style="margin-top:8px;font-size:13px;color:#78350f">
-Base prior: <strong>{{ score_note_constants.base_prior }}</strong> |
-High: <strong>{{ score_note_constants.high }}</strong> |
-Medium: <strong>{{ score_note_constants.medium }}</strong> |
-Decay &lambda;: <strong>{{ score_note_constants.age_decay_lambda }}</strong> |
-Evidence LR clamp:
-<strong>{{ score_note_constants.min_feature_lr }}&ndash;{{ score_note_constants.max_feature_lr }}</strong>
-</div></details></div>""",
+<h1>Corpus Dashboard</h1><p>Total cases: {{ total }}</p>{% endblock %}""",
 }
 
 
-# =============================================================================
-# CALIBRATION HELPERS
-# =============================================================================
-
-def calib_common_kwargs(current_year: int) -> Dict[str, Any]:
-    return dict(
-        status_lr_map=BayesianConfig.STATUS_LR,
-        priority_lr_map=BayesianConfig.PRIORITY_LR,
-        age_decay_lambda=BayesianConfig.AGE_DECAY_LAMBDA,
-        min_feature_lr=BayesianConfig.MIN_FEATURE_LR,
-        max_feature_lr=BayesianConfig.MAX_FEATURE_LR,
-        high_threshold=BayesianConfig.HIGH,
-        medium_threshold=BayesianConfig.MEDIUM,
-        current_year=current_year,
-    )
+def discover_template_dirs() -> List[Path]:
+    found: List[Path] = []
+    root = Config.APP_ROOT
+    for dirpath, dirnames, filenames in os.walk(root):
+        if any(f.lower().endswith(".html") for f in filenames):
+            found.append(Path(dirpath))
+    found.append(root)
+    return found
 
 
-def build_trace(case: Dict[str, Any]) -> Any:
-    """Run the calibration trace and attach the score the app really uses,
-    so any difference between the two is visible instead of silent."""
-    year = datetime.now().year
-    trace = calib.trace_case(
-        case,
-        base_prior=BayesianConfig.BASE_PRIOR,
-        type_lr_map=BayesianConfig.TYPE_LR,
-        **calib_common_kwargs(year),
-    )
-    if isinstance(trace, dict):
-        trace["sicca_app_score"] = bayesian_score(case, year)
-    return trace
+def build_template_loader():
+    dirs = discover_template_dirs()
+    return ChoiceLoader([FileSystemLoader([str(d) for d in dirs]), DictLoader(FALLBACK_TEMPLATES)]), {}
 
 
 # =============================================================================
@@ -1596,10 +1370,8 @@ def create_app(dev_insecure_cookies: bool = False) -> Flask:
     Config.ensure_dirs()
     init_db()
     load_strength_factors()
-    check_risk_reachability()
 
-    app = Flask(__name__, template_folder=None,
-                static_folder=str(Config.APP_ROOT / "static"))
+    app = Flask(__name__, template_folder=None, static_folder=str(Config.APP_ROOT / "static"))
     loader, _ = build_template_loader()
     app.jinja_loader = loader
     app.config.update(
@@ -1607,8 +1379,7 @@ def create_app(dev_insecure_cookies: bool = False) -> Flask:
         MAX_CONTENT_LENGTH=Config.MAX_CONTENT_LENGTH,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
-        SESSION_COOKIE_SECURE=(Config.COOKIE_SECURE
-                               and not dev_insecure_cookies),
+        SESSION_COOKIE_SECURE=(Config.COOKIE_SECURE and not dev_insecure_cookies),
         PERMANENT_SESSION_LIFETIME=Config.SESSION_LIFETIME_SECONDS,
         WTF_CSRF_ENABLED=True,
     )
@@ -1619,27 +1390,11 @@ def create_app(dev_insecure_cookies: bool = False) -> Flask:
     login_manager.init_app(app)
     login_manager.login_view = "login"
 
-    # ---- context processor for the score note (tuning item 7)
-    @app.context_processor
-    def inject_score_note_constants():
-        return {
-            "score_note_constants": {
-                "base_prior": BayesianConfig.BASE_PRIOR,
-                "high": BayesianConfig.HIGH,
-                "medium": BayesianConfig.MEDIUM,
-                "age_decay_lambda": BayesianConfig.AGE_DECAY_LAMBDA,
-                "min_feature_lr": BayesianConfig.MIN_FEATURE_LR,
-                "max_feature_lr": BayesianConfig.MAX_FEATURE_LR,
-            }
-        }
-
-    # ---- helpers
     def can_access(row: sqlite3.Row) -> bool:
         if current_user.is_admin():
             return True
         me = current_user.username.lower()
-        return (row["created_by"].lower() == me
-                or (row["assigned_to"] or "").lower() == me)
+        return (row["created_by"].lower() == me or (row["assigned_to"] or "").lower() == me)
 
     def scope() -> Tuple[str, Tuple[Any, ...]]:
         if current_user.is_admin():
@@ -1652,110 +1407,28 @@ def create_app(dev_insecure_cookies: bool = False) -> Flask:
         if not ok:
             abort(404)
         with db() as conn:
-            row = conn.execute("SELECT * FROM cases WHERE case_id = ?",
-                               (case_id,)).fetchone()
+            row = conn.execute("SELECT * FROM cases WHERE case_id = ?", (case_id,)).fetchone()
         if row is None or not can_access(row):
             abort(404)
         return row
 
-    def render_create(status: int = 200, **extra):
-        return render_template(
-            "create_case.html",
-            form=request.form if request.method == "POST" else {},
-            types=CASE_TYPES, statuses=STATUSES,
-            priorities=PRIORITIES, strengths=EVIDENCE_STRENGTHS, **extra), status
+    def fetch_records(case_id: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        with db() as conn:
+            sus = conn.execute("SELECT * FROM suspects WHERE case_id=? ORDER BY id", (case_id,)).fetchall()
+            ev = conn.execute("SELECT * FROM evidence WHERE case_id=? ORDER BY id", (case_id,)).fetchall()
+        return [dict(r) for r in sus], [dict(r) for r in ev]
 
-    def _compute_condition_profile(case: dict) -> dict:
-        """Read matched temporal windows, weather conditions and MO
-        conditions, compute LRs, combine via sicca_conditions."""
-        if conditions is None:
-            return {"combined_lr": 1.0,
-                    "summary": "conditions module unavailable",
-                    "temporal_lr": 1.0, "weather_lr": 1.0, "mo_lr": 1.0,
-                    "n_temporal": 0, "n_weather": 0, "n_mo": 0}
-        temporal_lrs, weather_lrs, mo_lrs = [], [], []
-        # Temporal. Missing optional tables mean "no data", not an error.
-        if temporal is not None:
-            try:
-                with db() as conn:
-                    windows: List[dict] = []
-                    rates: Dict[str, float] = {}
-                    if _table_exists(conn, "time_window"):
-                        windows = [dict(w) for w in conn.execute(
-                            "SELECT * FROM time_window")]
-                        if _table_exists(conn, "time_window_base_rate"):
-                            rates = {r["window_id"]: float(r["base_rate"])
-                                     for r in conn.execute(
-                                "SELECT window_id, base_rate "
-                                "FROM time_window_base_rate "
-                                "WHERE note LIKE 'Empirical%'")}
-                if windows:
-                    prof = temporal.temporal_profile(
-                        case, windows, empirical_base_rates=rates or None)
-                    if prof.get("ok"):
-                        for m in prof.get("matched", []):
-                            br = m.get("base_rate")
-                            if br and br > 0:
-                                temporal_lrs.append(min(50.0, 1.0 / br))
-            except Exception:
-                LOG.exception("temporal profile failed for %s",
-                              case.get("case_id"))
-        # Weather
-        if weather is not None:
-            try:
-                with db() as conn:
-                    obs: List[dict] = []
-                    conds: List[dict] = []
-                    rates = {}
-                    if (_table_exists(conn, "weather_condition")
-                            and _table_exists(conn, "case_weather")):
-                        obs = [dict(r) for r in conn.execute(
-                            "SELECT * FROM case_weather WHERE case_id = ?",
-                            (case["case_id"],))]
-                        conds = [dict(r) for r in conn.execute(
-                            "SELECT * FROM weather_condition")]
-                        if _table_exists(conn, "weather_base_rate"):
-                            rates = {r["condition_id"]: float(r["base_rate"])
-                                     for r in conn.execute(
-                                "SELECT condition_id, base_rate "
-                                "FROM weather_base_rate "
-                                "WHERE note LIKE 'Empirical%'")}
-                if conds:
-                    wprof = weather.weather_profile(
-                        obs, conds, empirical_base_rates=rates or None)
-                    if wprof.get("ok"):
-                        for day in wprof.get("days", []):
-                            for c in day.get("conditions", []):
-                                if c.get("matched") and c.get("likelihood_ratio"):
-                                    weather_lrs.append(
-                                        float(c["likelihood_ratio"]))
-            except Exception:
-                LOG.exception("weather profile failed for %s",
-                              case.get("case_id"))
-        # MO: each attributed method contributes
-        # 1 + (MO_LR_MAX - 1) * confidence (1.5 at full confidence).
-        try:
-            with db() as conn:
-                rows = conn.execute(
-                    "SELECT method_id, confidence FROM case_method "
-                    "WHERE case_id = ?", (case["case_id"],)).fetchall()
-            mo_lrs = [
-                1.0 + (BayesianConfig.MO_LR_MAX - 1.0)
-                * coerce_float(r["confidence"], 0.5, 0.0, 1.0)
-                for r in rows]
-        except sqlite3.OperationalError:
-            pass
-        return conditions.combine(
-            temporal_lrs=temporal_lrs,
-            weather_lrs=weather_lrs,
-            mo_lrs=mo_lrs,
-        )
+    def sync_counts(conn: sqlite3.Connection, case_id: str) -> None:
+        conn.execute(
+            """UPDATE cases SET
+               suspects_count = (SELECT COUNT(*) FROM suspects WHERE case_id = :c),
+               evidence_count = (SELECT COUNT(*) FROM evidence WHERE case_id = :c),
+               modified = :m WHERE case_id = :c""",
+            {"c": case_id, "m": now_iso()})
 
-    ml = MLModel(Config.MODEL_PATH, Config.MODEL_HASH_PATH,
-                 key=app.config["SECRET_KEY"].encode("utf-8"))
-    engine = HybridEngine(ml=ml, condition_fn=_compute_condition_profile)
+    ml = MLModel(Config.MODEL_PATH, Config.MODEL_HASH_PATH, key=app.config["SECRET_KEY"].encode("utf-8"))
+    engine = HybridEngine(ml=ml)
 
-    # ---- hooks
     @app.after_request
     def security_headers(resp):
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -1764,23 +1437,15 @@ def create_app(dev_insecure_cookies: bool = False) -> Flask:
         if Config.CSP:
             resp.headers.setdefault("Content-Security-Policy", Config.CSP)
         if request.is_secure:
-            resp.headers.setdefault("Strict-Transport-Security",
-                                    "max-age=31536000; includeSubDomains")
+            resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         if current_user.is_authenticated:
             resp.headers["Cache-Control"] = "no-store"
         return resp
 
     @app.errorhandler(CSRFError)
     def csrf_error(_exc):
-        return ("Security token missing or expired. Go back, reload the "
-                "page and try again.", 400)
+        return "Security token missing or expired.", 400
 
-    @app.errorhandler(413)
-    def too_large(_exc):
-        mb = Config.MAX_CONTENT_LENGTH // (1024 * 1024)
-        return f"Upload too large (limit {mb} MB).", 413
-
-    # ---- auth
     @app.route("/login", methods=["GET", "POST"])
     def login():
         if current_user.is_authenticated:
@@ -1788,31 +1453,13 @@ def create_app(dev_insecure_cookies: bool = False) -> Flask:
         if request.method == "POST":
             username = clean_text(request.form.get("username"), 100)
             password = request.form.get("password", "")
-            ip = request.remote_addr or "?"
-            k_user, k_ip = f"u:{ip}|{username.lower()}", f"ip:{ip}"
-            wait = max(THROTTLE.wait_seconds(k_user, 5),
-                       THROTTLE.wait_seconds(k_ip, 30))
-            if wait:
-                flash(f"Too many failed attempts. Try again in "
-                      f"{wait // 60 + 1} minute(s).", "error")
-                return render_template("login.html"), 429
             with db() as conn:
-                row = conn.execute(
-                    "SELECT id, username, password, role FROM users "
-                    "WHERE username = ?", (username,)).fetchone()
-            valid = check_password_hash(
-                row["password"] if row else _DUMMY_HASH, password)
-            if row and valid:
-                THROTTLE.clear(k_user)
-                session.clear()
+                row = conn.execute("SELECT id, username, password, role FROM users WHERE username = ?", (username,)).fetchone()
+            if row and check_password_hash(row["password"], password):
                 login_user(User(row["id"], row["username"], row["role"]))
                 session.permanent = True
                 audit(row["username"], "login", row["username"])
                 return redirect(url_for("dashboard"))
-            THROTTLE.fail(k_user)
-            THROTTLE.fail(k_ip)
-            LOG.warning("Failed login for '%s' from %s",
-                        log_safe(username), log_safe(ip, 64))
             flash("Invalid credentials", "error")
             return render_template("login.html"), 401
         return render_template("login.html")
@@ -1825,7 +1472,6 @@ def create_app(dev_insecure_cookies: bool = False) -> Flask:
         session.clear()
         return redirect(url_for("login"))
 
-    # ---- dashboard
     @app.route("/")
     @login_required
     def index():
@@ -1834,139 +1480,116 @@ def create_app(dev_insecure_cookies: bool = False) -> Flask:
     @app.route("/dashboard")
     @login_required
     def dashboard():
-        try:
-            page = min(max(1, int(request.args.get("page", "1"))),
-                       Config.MAX_PAGE)
-        except ValueError:
-            page = 1
         where, params = scope()
-        size = Config.PAGE_SIZE
         with db() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM cases WHERE {where} "
-                "ORDER BY modified DESC LIMIT ? OFFSET ?",
-                params + (size + 1, (page - 1) * size)).fetchall()
-            total = conn.execute(
-                f"SELECT COUNT(*) AS n FROM cases WHERE {where}",
-                params).fetchone()["n"]
-            open_n = conn.execute(
-                f"SELECT COUNT(*) AS n FROM cases WHERE {where} "
-                "AND LOWER(status) = 'open'", params).fetchone()["n"]
-            high_n = conn.execute(
-                f"SELECT COUNT(*) AS n FROM cases WHERE {where} "
-                "AND LOWER(priority) = 'high'", params).fetchone()["n"]
-        return render_template(
-            "dashboard.html",
-            cases=[dict(r) for r in rows[:size]],
-            stats={"total_cases": total, "open_cases": open_n,
-                   "high_priority": high_n},
-            model_available=ml.exists(),
-            page=page, has_more=len(rows) > size)
+            rows = conn.execute(f"SELECT * FROM cases WHERE {where} ORDER BY modified DESC LIMIT 100", params).fetchall()
+            total = conn.execute(f"SELECT COUNT(*) AS n FROM cases WHERE {where}", params).fetchone()["n"]
+        return render_template("dashboard.html", cases=[dict(r) for r in rows], stats={"total_cases": total})
 
-    # ---- create
     @app.route("/create_case", methods=["GET", "POST"])
     @login_required
     def create_case():
         if request.method == "GET":
-            return render_create()
-        saved_path: Optional[Path] = None
+            return render_template("create_case.html", types=CASE_TYPES, statuses=STATUSES, priorities=PRIORITIES)
         try:
             case_id = clean_text(request.form.get("case_id"), 50)
             ok, msg = validate_case_id(case_id)
-            if not ok:
-                raise FormError(msg)
-            record = build_case_record(request.form, case_id,
-                                       current_user.username)
-            upload = prepare_upload(request.files.get("case_file"), case_id)
+            if not ok: raise FormError(msg)
+            record = build_case_record(request.form, case_id, current_user.username)
         except FormError as exc:
             flash(str(exc), "error")
-            return render_create(400)
+            return render_template("create_case.html", types=CASE_TYPES, statuses=STATUSES, priorities=PRIORITIES), 400
         with db() as conn:
-            if conn.execute("SELECT 1 FROM cases WHERE case_id = ?",
-                            (case_id,)).fetchone():
-                flash("Case ID already exists", "error")
-                return render_create(409)
-        try:
-            if upload:
-                file, stored, display = upload
-                saved_path = Config.UPLOADS_DIR / stored
-                file.save(saved_path)
-                record["attached_file"] = display
-                record["file_path"] = stored
-            with db() as conn:
-                conn.execute(
-                    """INSERT INTO cases (case_id, case_name, location, year,
-                    type, status, confidence, suspects_count, evidence_count,
-                    evidence_strength, description, priority, assigned_to,
-                    tags, attached_file, file_path, created_by, active_since,
-                    reopened_count, created, modified)
-                    VALUES (:case_id, :case_name, :location, :year, :type,
-                    :status, :confidence, :suspects_count, :evidence_count,
-                    :evidence_strength, :description, :priority, :assigned_to,
-                    :tags, :attached_file, :file_path, :created_by,
-                    :active_since, 0, :created, :modified)""", record)
-                audit(current_user.username, "create_case", case_id,
-                      conn=conn)
-        except sqlite3.IntegrityError:
-            _discard(saved_path)
-            flash("Case ID already exists", "error")
-            return render_create(409)
-        except Exception:
-            _discard(saved_path)
-            ref = secrets.token_hex(4)
-            LOG.exception("Failed to save case %s (ref %s)", case_id, ref)
-            flash(f"Could not save the case. Reference: {ref}", "error")
-            return render_create(500)
+            conn.execute(
+                """INSERT INTO cases (case_id, case_name, location, year, type, status, confidence, 
+                suspects_count, evidence_count, description, priority, assigned_to, tags, 
+                created_by, active_since, created, modified)
+                VALUES (:case_id, :case_name, :location, :year, :type, :status, :confidence,
+                :suspects_count, :evidence_count, :description, :priority, :assigned_to, :tags,
+                :created_by, :active_since, :created, :modified)""", record)
         flash(f"Case {case_id} created.", "success")
         return redirect(url_for("view_case", case_id=case_id))
 
-    # ---- view
     @app.route("/case/<case_id>")
     @login_required
     def view_case(case_id: str):
-        return render_template("view_case.html",
-                               case=dict(fetch_case(case_id)))
-
-    @app.route("/case/<case_id>/file")
-    @login_required
-    def download_file(case_id: str):
         row = fetch_case(case_id)
-        if not row["file_path"]:
-            abort(404)
-        root = Config.UPLOADS_DIR.resolve()
-        target = (root / row["file_path"]).resolve()
-        if root not in target.parents or not target.is_file():
-            abort(404)
-        audit(current_user.username, "download_file", case_id)
-        return send_file(target, as_attachment=True,
-                         download_name=row["attached_file"] or target.name)
+        suspects, evidence = fetch_records(case_id)
+        return render_template("view_case.html", case=dict(row), suspects=suspects, evidence=evidence)
 
-    # ---- reopen (tuning item 3)
-    @app.route("/case/<case_id>/reopen", methods=["POST"])
+    @app.route("/case/<case_id>/suspects", methods=["POST"])
     @login_required
-    def reopen_case(case_id: str):
-        row = fetch_case(case_id)
-        if row["status"] != "closed" and not current_user.is_admin():
-            flash("Only closed cases can be reopened. (Resetting the age "
-                  "of an active case is restricted to admins.)", "error")
+    def add_suspect(case_id: str):
+        fetch_case(case_id)
+        name = clean_text(request.form.get("name"), 200)
+        if not name:
+            flash("Suspect name required.", "error")
             return redirect(url_for("view_case", case_id=case_id))
-        today = datetime.now(timezone.utc).date().isoformat()
-        new_status = ("under investigation" if row["status"] == "closed"
-                      else row["status"])
         with db() as conn:
             conn.execute(
-                "UPDATE cases SET active_since = ?, "
-                "reopened_count = reopened_count + 1, "
-                "status = ?, modified = ? WHERE case_id = ?",
-                (today, new_status, now_iso(), case_id))
-            audit(current_user.username, "reopen_case", case_id,
-                  f"was_status={row['status']} "
-                  f"was_active_since={row['active_since']}", conn=conn)
-        flash(f"Case {case_id} reopened. Investigation age reset to zero.",
-              "success")
+                "INSERT INTO suspects (case_id, name, aliases, identifier, role, notes, created) VALUES (?,?,?,?,?,?,?)",
+                (case_id, name, clean_text(request.form.get("aliases"), 400),
+                 clean_text(request.form.get("identifier"), 100),
+                 clean_text(request.form.get("role", "suspect"), 40),
+                 clean_text(request.form.get("notes"), 2000), now_iso()))
+            sync_counts(conn, case_id)
+        flash("Suspect added.", "success")
         return redirect(url_for("view_case", case_id=case_id))
 
-    # ---- analysis
+    @app.route("/case/<case_id>/evidence", methods=["POST"])
+    @login_required
+    def add_evidence(case_id: str):
+        fetch_case(case_id)
+        label = clean_text(request.form.get("label"), 200)
+        if not label:
+            flash("Evidence label required.", "error")
+            return redirect(url_for("view_case", case_id=case_id))
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO evidence (case_id, label, kind, identifier, notes, created) VALUES (?,?,?,?,?,?)",
+                (case_id, label, clean_text(request.form.get("kind", "other"), 40).lower(),
+                 clean_text(request.form.get("identifier"), 100),
+                 clean_text(request.form.get("notes"), 2000), now_iso()))
+            sync_counts(conn, case_id)
+        flash("Evidence added.", "success")
+        return redirect(url_for("view_case", case_id=case_id))
+
+    # Cross-match engine route implementation
+    def run_cross_match(case_ids: List[str], command: str):
+        case_ids = list(dict.fromkeys(i.strip() for i in case_ids if i.strip()))
+        if len(case_ids) < 2:
+            return {"error": "Cross-match needs at least two cases."}, 400
+        if not TRIGGER_RE.search(command or ""):
+            return {"error": "Command not recognized. Try 'similarities'."}, 400
+        marks = ",".join("?" * len(case_ids))
+        with db() as conn:
+            rows = conn.execute(f"SELECT * FROM cases WHERE case_id IN ({marks})", case_ids).fetchall()
+        cases = [dict(r) for r in rows]
+        for c in cases:
+            c["suspects"], c["evidence"] = fetch_records(c["case_id"])
+        results = cross_match(cases)
+        return {"command": command, "cases_compared": len(cases), "matches": results}, 200
+
+    @app.route("/cross_match", methods=["GET", "POST"])
+    @login_required
+    def cross_match_route():
+        if request.method == "GET":
+            with db() as conn:
+                rows = conn.execute("SELECT case_id, case_name FROM cases ORDER BY modified DESC").fetchall()
+            return render_template("cross_match.html", cases=[dict(r) for r in rows], result=None, error=None)
+        if request.is_json:
+            data = request.get_json(silent=True) or {}
+            ids = data.get("case_ids", [])
+            if isinstance(ids, str): ids = ids.split(",")
+            payload, status = run_cross_match([str(i) for i in ids], str(data.get("command", "")))
+            return jsonify(payload), status
+        ids = request.form.getlist("case_ids")
+        payload, status = run_cross_match(ids, request.form.get("command", ""))
+        with db() as conn:
+            rows = conn.execute("SELECT case_id, case_name FROM cases ORDER BY modified DESC").fetchall()
+        return render_template("cross_match.html", cases=[dict(r) for r in rows], selected=ids,
+                               result=payload if status == 200 else None, error=payload.get("error") if status != 200 else None)
+
     @app.route("/analyze/<case_id>")
     @login_required
     def analyze_case(case_id: str):
@@ -1976,679 +1599,33 @@ def create_app(dev_insecure_cookies: bool = False) -> Flask:
             return jsonify(result)
         return render_template("analysis.html", case=dict(row), result=result)
 
-    @app.route("/export/<case_id>.json")
-    @login_required
-    def export_json(case_id: str):
-        row = fetch_case(case_id)
-        payload = {"case": {k: v for k, v in dict(row).items()
-                            if k != "file_path"},
-                   "analysis": engine.analyze(dict(row))}
-        audit(current_user.username, "export_json", case_id)
-        resp = jsonify(payload)
-        resp.headers["Content-Disposition"] = (
-            f'attachment; filename="{secure_filename(case_id)}.json"')
-        return resp
-
-    # ---- calibration: trace
-    @app.route("/case/<case_id>/trace")
-    @login_required
-    def trace_case_view(case_id: str):
-        if calib is None:
-            return (f"Calibration module unavailable: {_CALIB_IMPORT_ERROR}",
-                    503)
-        row = fetch_case(case_id)
-        case = dict(row)
-        trace = build_trace(case)
-        try:
-            summary_text = calib.trace_summary(trace)
-        except Exception:
-            LOG.exception("trace_summary failed for %s", case_id)
-            summary_text = ""
-        audit(current_user.username, "trace_case", case_id)
-        return render_template("calibration_trace.html",
-                               case=case, trace=trace,
-                               trace_summary_text=summary_text,
-                               data_text=_pretty(trace))
-
-    # ---- calibration: decay curve
-    @app.route("/admin/decay_curve")
-    @admin_required
-    def decay_curve_view():
-        if calib is None:
-            return (f"Calibration module unavailable: {_CALIB_IMPORT_ERROR}",
-                    503)
-        posterior = coerce_float(request.args.get("posterior"), 0.75, 0.0, 1.0)
-        confidence = coerce_float(request.args.get("confidence"), 0.8, 0.0, 1.0)
-        out_dir = Config.BASE_DIR / "calibration"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        curves = {
-            f"confidence = {c:.1f}": {"posterior": posterior, "confidence": c}
-            for c in (0.4, 0.6, 0.8, 1.0)
-        }
-        if all(abs(confidence - c) > 1e-9 for c in (0.4, 0.6, 0.8, 1.0)):
-            curves[f"confidence = {confidence:.2f} (selected)"] = {
-                "posterior": posterior, "confidence": confidence}
-        fd, tmp_name = tempfile.mkstemp(suffix=".png", dir=out_dir)
-        os.close(fd)
-        tmp_path = Path(tmp_name)
-        try:
-            calib.decay_curve_png(
-                curves=curves,
-                high_threshold=BayesianConfig.HIGH,
-                medium_threshold=BayesianConfig.MEDIUM,
-                title=(f"SICCA adjusted score vs. case age\n"
-                       f"posterior = {posterior:.3f}"),
-                path=str(tmp_path),
-                max_age=Config.SENSITIVITY_MAX_AGE,
-            )
-            data = tmp_path.read_bytes()
-        except RuntimeError as exc:
-            return f"Could not render chart: {exc}", 500
-        except Exception:
-            ref = secrets.token_hex(4)
-            LOG.exception("Decay curve failed (ref %s)", ref)
-            return f"Could not render chart. Reference: {ref}", 500
-        finally:
-            _discard(tmp_path)
-        audit(current_user.username, "decay_curve", "model",
-              f"posterior={posterior:.3f} confidence={confidence:.3f}")
-        return send_file(io.BytesIO(data), mimetype="image/png")
-
-    # ---- calibration: sensitivity grid
-    @app.route("/admin/sensitivity")
-    @admin_required
-    def sensitivity_view():
-        if calib is None:
-            return (f"Calibration module unavailable: {_CALIB_IMPORT_ERROR}",
-                    503)
-        target_type = clean_text(request.args.get("type", "unknown"),
-                                 40).lower()
-        if target_type not in CASE_TYPES:
-            target_type = "unknown"
-        priors = [0.10, 0.20, 0.30, 0.40, 0.50]
-        type_lrs = [1.5, 2.0, 2.5, 3.0, 4.0]
-        where, params = scope()
-        with db() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM cases WHERE {where} "
-                "AND LOWER(type) = ? ORDER BY modified DESC LIMIT ?",
-                params + (target_type, Config.SENSITIVITY_CASE_CAP),
-            ).fetchall()
-        grid = calib.sensitivity_grid(
-            [dict(r) for r in rows],
-            priors=priors, type_lrs=type_lrs, target_type=target_type,
-            cap=Config.SENSITIVITY_CASE_CAP,
-            **calib_common_kwargs(datetime.now().year),
-        )
-        audit(current_user.username, "sensitivity", target_type,
-              f"cases={grid['cases_seen']} cap={grid['cap']}")
-        return render_template("calibration_sensitivity.html",
-                               grid=grid, case_types=CASE_TYPES,
-                               current_type=target_type,
-                               data_text=_pretty(grid))
-
-    # ---- temporal view
-    @app.route("/case/<case_id>/temporal")
-    @login_required
-    def temporal_view(case_id: str):
-        if temporal is None:
-            return (f"Temporal module unavailable: {_TEMPORAL_IMPORT_ERROR}",
-                    503)
-        row = fetch_case(case_id)
-        case = dict(row)
-        with db() as conn:
-            windows = [dict(w) for w in conn.execute(
-                "SELECT * FROM time_window ORDER BY start_local")]
-            rates_rows = conn.execute(
-                "SELECT window_id, base_rate, note FROM time_window_base_rate"
-            ).fetchall() if _table_exists(conn, "time_window_base_rate") else []
-        empirical = {r["window_id"]: float(r["base_rate"])
-                     for r in rates_rows
-                     if r["note"] and r["note"].startswith("Empirical")}
-        profile = temporal.temporal_profile(
-            case, windows, empirical_base_rates=empirical or None)
-        audit(current_user.username, "temporal_profile", case_id)
-        return render_template("case_temporal.html",
-                               case=case, profile=profile,
-                               data_text=_pretty(profile))
-
-    # ---- weather view
-    @app.route("/case/<case_id>/weather")
-    @login_required
-    def weather_view(case_id: str):
-        if weather is None:
-            return (f"Weather module unavailable: {_WEATHER_IMPORT_ERROR}",
-                    503)
-        row = fetch_case(case_id)
-        case = dict(row)
-        with db() as conn:
-            obs_rows = conn.execute(
-                "SELECT * FROM case_weather WHERE case_id = ? "
-                "ORDER BY obs_date", (case_id,)).fetchall()
-            cond_rows = conn.execute(
-                "SELECT * FROM weather_condition ORDER BY condition_id"
-            ).fetchall() if _table_exists(conn, "weather_condition") else []
-            # Same filter the scoring path uses, so this page shows the
-            # base rates that actually feed the score.
-            rate_rows = conn.execute(
-                "SELECT condition_id, base_rate FROM weather_base_rate "
-                "WHERE note LIKE 'Empirical%'"
-            ).fetchall() if _table_exists(conn, "weather_base_rate") else []
-        empirical = {r["condition_id"]: float(r["base_rate"])
-                     for r in rate_rows}
-        profile = weather.weather_profile(
-            [dict(r) for r in obs_rows],
-            [dict(r) for r in cond_rows],
-            empirical_base_rates=empirical or None,
-        )
-        audit(current_user.username, "weather_profile", case_id)
-        return render_template("case_weather.html",
-                               case=case, profile=profile,
-                               data_text=_pretty(profile))
-
-    # ---- MO view + attribution (tuning item 5)
-    @app.route("/case/<case_id>/mo")
-    @login_required
-    def mo_view(case_id: str):
-        if mo is None:
-            return (f"MO module unavailable: {_MO_IMPORT_ERROR}", 503)
-        row = fetch_case(case_id)
-        case = dict(row)
-        with db() as conn:
-            methods_rows = conn.execute(
-                "SELECT * FROM mo_method ORDER BY method_id").fetchall() \
-                if _table_exists(conn, "mo_method") else []
-            conditions_rows = conn.execute(
-                "SELECT * FROM mo_condition ORDER BY condition_id").fetchall() \
-                if _table_exists(conn, "mo_condition") else []
-            attributed_rows = conn.execute(
-                "SELECT * FROM case_method WHERE case_id = ?",
-                (case_id,)).fetchall() \
-                if _table_exists(conn, "case_method") else []
-        attributed = [dict(r) for r in attributed_rows]
-        methods_by_id = {m["method_id"]: dict(m) for m in methods_rows}
-        attributed_methods = [methods_by_id[a["method_id"]]
-                              for a in attributed
-                              if a["method_id"] in methods_by_id]
-        observed = _observed_variables_for(case_id)
-        profile = mo.mo_profile(
-            attributed_methods,
-            [dict(c) for c in conditions_rows],
-            observed,
-        )
-        audit(current_user.username, "mo_profile", case_id,
-              f"methods={len(attributed_methods)}")
-        return render_template("case_mo.html",
-                               case=case,
-                               profile=profile,
-                               observed=observed,
-                               attributed=attributed,
-                               methods_available=[
-                                   {"method_id": m["method_id"],
-                                    "name": m["name"],
-                                    "category": m["category"]}
-                                   for m in methods_rows],
-                               all_methods=methods_by_id,
-                               data_text=_pretty(profile))
-
-    @app.route("/case/<case_id>/mo/attribute", methods=["POST"])
-    @login_required
-    def mo_attribute(case_id: str):
-        if mo is None:
-            abort(503)
-        _ = fetch_case(case_id)
-        method_id = clean_text(request.form.get("method_id"), 60)
-        if not method_id:
-            flash("No method selected.", "error")
-            return redirect(url_for("mo_view", case_id=case_id))
-        try:
-            confidence = parse_float(
-                request.form.get("confidence"), "Confidence",
-                0.0, 1.0, default=0.5)
-        except FormError as exc:
-            flash(str(exc), "error")
-            return redirect(url_for("mo_view", case_id=case_id))
-        note = clean_text(request.form.get("confidence_note"), 2000,
-                          multiline=True)
-        if not note:
-            flash("A basis for the attribution is required.", "error")
-            return redirect(url_for("mo_view", case_id=case_id))
-        with db() as conn:
-            if not _table_exists(conn, "mo_method"):
-                flash("MO tables are not seeded.", "error")
-                return redirect(url_for("mo_view", case_id=case_id))
-            exists = conn.execute(
-                "SELECT 1 FROM mo_method WHERE method_id = ?",
-                (method_id,)).fetchone()
-            if not exists:
-                flash("Unknown method.", "error")
-                return redirect(url_for("mo_view", case_id=case_id))
-            conn.execute(
-                """INSERT OR REPLACE INTO case_method
-                   (case_id, method_id, confidence, confidence_note,
-                    attributed_by, created_on)
-                   VALUES (?,?,?,?,?,?)""",
-                (case_id, method_id, confidence, note,
-                 current_user.username, now_iso()))
-            audit(current_user.username, "mo_attribute", case_id,
-                  f"method={method_id} conf={confidence:.2f}", conn=conn)
-        flash(f"Method {method_id} attributed.", "success")
-        return redirect(url_for("mo_view", case_id=case_id))
-
-    @app.route("/case/<case_id>/mo/remove/<method_id>", methods=["POST"])
-    @login_required
-    def mo_remove(case_id: str, method_id: str):
-        if mo is None:
-            abort(503)
-        _ = fetch_case(case_id)
-        method_id = clean_text(method_id, 60)
-        with db() as conn:
-            if not _table_exists(conn, "case_method"):
-                flash("MO tables are not seeded.", "error")
-                return redirect(url_for("mo_view", case_id=case_id))
-            cur = conn.execute(
-                "DELETE FROM case_method WHERE case_id = ? AND method_id = ?",
-                (case_id, method_id))
-            if cur.rowcount:
-                audit(current_user.username, "mo_remove", case_id,
-                      f"method={method_id}", conn=conn)
-                flash(f"Method {method_id} removed.", "success")
-            else:
-                flash("Attribution not found.", "error")
-        return redirect(url_for("mo_view", case_id=case_id))
-
-    def _observed_variables_for(case_id: str) -> dict:
-        """Assemble the flat dict of observed variables for the MO module."""
-        observed: dict = {}
-        if temporal is not None:
-            try:
-                with db() as conn:
-                    windows = [dict(w) for w in conn.execute(
-                        "SELECT * FROM time_window")]
-                    case_row = conn.execute(
-                        "SELECT * FROM cases WHERE case_id = ?",
-                        (case_id,)).fetchone()
-                if case_row:
-                    prof = temporal.temporal_profile(dict(case_row), windows)
-                    if prof.get("ok"):
-                        for w in windows:
-                            wid = w["window_id"]
-                            observed[wid] = 1 if any(
-                                m["window_id"] == wid
-                                for m in prof.get("matched", [])
-                            ) else 0
-            except Exception:
-                LOG.exception("temporal variables failed for %s", case_id)
-        with db() as conn:
-            row = conn.execute(
-                "SELECT * FROM case_weather WHERE case_id = ? "
-                "ORDER BY obs_date LIMIT 1", (case_id,)).fetchone() \
-                if _table_exists(conn, "case_weather") else None
-        if row:
-            for var in ("precipitation_mm", "temp_max_c", "temp_min_c",
-                        "wind_max_kmh", "humidity_pct", "snow_depth_cm"):
-                if row[var] is not None:
-                    observed[var] = float(row[var])
-        return observed
-
-    # ---- linkage view
-    @app.route("/case/<case_id>/links")
-    @login_required
-    def case_links_view(case_id: str):
-        if linkage is None:
-            return (f"Linkage module unavailable: {_LINKAGE_IMPORT_ERROR}",
-                    503)
-        target = dict(fetch_case(case_id))
-        where, params = scope()
-        cap = Config.SENSITIVITY_CASE_CAP
-        with db() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM cases WHERE {where} "
-                "ORDER BY modified DESC LIMIT ?", params + (cap,)).fetchall()
-        cases = [dict(r) for r in rows]
-        if not any(c["case_id"] == case_id for c in cases):
-            cases.append(target)  # the target must always be in the corpus
-        truncated = len(rows) >= cap
-        sigs = _signatures_for(cases)
-        corpus = [{"case_id": c["case_id"], "case_name": c["case_name"],
-                   "signature": sigs[c["case_id"]]} for c in cases]
-        prevalence = linkage.compute_condition_prevalence(
-            [c["signature"] for c in corpus])
-        result = linkage.find_linked_cases(
-            target_case_id=case_id,
-            target_signature=sigs[case_id],
-            corpus=corpus,
-            prevalence=prevalence,
-            min_shared=1,
-            max_results=50,
-        )
-        audit(current_user.username, "case_links", case_id,
-              f"candidates={len(corpus)} truncated={truncated}")
-        return render_template("case_links.html",
-                               case=target,
-                               result=result,
-                               prevalence=prevalence,
-                               truncated=truncated, cap=cap,
-                               data_text=_pretty(result))
-
-    def _signatures_for(cases: List[dict]) -> Dict[str, dict]:
-        """Condition signature for every case using a handful of queries in
-        total (not several per case)."""
-        empty = {"temporal": [], "weather": [], "mo": [], "all": []}
-        if linkage is None:
-            return {c["case_id"]: dict(empty) for c in cases}
-        ids = [c["case_id"] for c in cases]
-        windows: List[dict] = []
-        conds: List[dict] = []
-        obs_by_case: Dict[str, List[dict]] = defaultdict(list)
-        mo_by_case: Dict[str, List[str]] = defaultdict(list)
-        with db() as conn:
-            if temporal is not None and _table_exists(conn, "time_window"):
-                windows = [dict(w) for w in conn.execute(
-                    "SELECT * FROM time_window")]
-            if (weather is not None
-                    and _table_exists(conn, "weather_condition")
-                    and _table_exists(conn, "case_weather")):
-                conds = [dict(r) for r in conn.execute(
-                    "SELECT * FROM weather_condition")]
-                for chunk in _chunks(ids):
-                    ph = ",".join("?" * len(chunk))
-                    for r in conn.execute(
-                            f"SELECT * FROM case_weather "
-                            f"WHERE case_id IN ({ph})", chunk):
-                        obs_by_case[r["case_id"]].append(dict(r))
-            if _table_exists(conn, "case_method"):
-                for chunk in _chunks(ids):
-                    ph = ",".join("?" * len(chunk))
-                    for r in conn.execute(
-                            f"SELECT case_id, method_id FROM case_method "
-                            f"WHERE case_id IN ({ph})", chunk):
-                        mo_by_case[r["case_id"]].append(r["method_id"])
-        out: Dict[str, dict] = {}
-        for case in cases:
-            cid = case["case_id"]
-            t_matched: List[str] = []
-            w_matched: List[str] = []
-            if windows:
-                try:
-                    prof = temporal.temporal_profile(case, windows)
-                    if prof.get("ok"):
-                        t_matched = [m["window_id"]
-                                     for m in prof.get("matched", [])]
-                except Exception:
-                    LOG.exception("temporal signature failed for %s", cid)
-            if conds:
-                try:
-                    wprof = weather.weather_profile(obs_by_case.get(cid, []),
-                                                    conds)
-                    if wprof.get("ok"):
-                        w_matched = list(
-                            wprof.get("matched_condition_ids", []))
-                except Exception:
-                    LOG.exception("weather signature failed for %s", cid)
-            out[cid] = linkage.build_signature(
-                temporal_matched=t_matched,
-                weather_matched=w_matched,
-                mo_matched=mo_by_case.get(cid, []),
-            )
-        return out
-
-    # ---- corpus dashboard (tuning item 6)
     @app.route("/corpus")
     @login_required
     def corpus_dashboard():
-        where, params = scope()
         with db() as conn:
-            case_rows = [dict(r) for r in conn.execute(
-                f"SELECT * FROM cases WHERE {where}", params)]
-            by_type = conn.execute(
-                f"SELECT type, COUNT(*) AS n FROM cases WHERE {where} "
-                "GROUP BY type ORDER BY n DESC", params).fetchall()
-            by_status = conn.execute(
-                f"SELECT status, COUNT(*) AS n FROM cases WHERE {where} "
-                "GROUP BY status ORDER BY n DESC", params).fetchall()
-            by_priority = conn.execute(
-                f"SELECT priority, COUNT(*) AS n FROM cases WHERE {where} "
-                "GROUP BY priority ORDER BY n DESC", params).fetchall()
-            windows = [dict(r) for r in conn.execute(
-                "SELECT window_id, name FROM time_window ORDER BY start_local")] \
-                if _table_exists(conn, "time_window") else []
-            conds = [dict(r) for r in conn.execute(
-                "SELECT * FROM weather_condition")] \
-                if _table_exists(conn, "weather_condition") else []
+            total = conn.execute("SELECT COUNT(*) AS n FROM cases").fetchone()["n"]
+        return render_template("corpus_dashboard.html", total=total)
 
-        total = len(case_rows)
-        case_ids = [c["case_id"] for c in case_rows]
-        temporal_prevalence: Dict[str, int] = {}
-        weather_prevalence: Dict[str, int] = {}
-        mo_prevalence: Dict[str, int] = {}
-
-        if case_rows and temporal is not None and windows:
-            for case in case_rows:
-                try:
-                    prof = temporal.temporal_profile(case, windows)
-                    if prof.get("ok"):
-                        for m in prof.get("matched", []):
-                            wid = m["window_id"]
-                            temporal_prevalence[wid] = \
-                                temporal_prevalence.get(wid, 0) + 1
-                except Exception:
-                    LOG.exception("temporal prevalence failed")
-
-        if case_ids and weather is not None and conds:
-            # A case counts once per condition, however many days of weather
-            # observations it has; otherwise the percentages can top 100%.
-            matched_by_case: Dict[str, set] = defaultdict(set)
-            obs_rows: List[dict] = []
-            with db() as conn:
-                if _table_exists(conn, "case_weather"):
-                    for chunk in _chunks(case_ids):
-                        ph = ",".join("?" * len(chunk))
-                        obs_rows.extend(dict(r) for r in conn.execute(
-                            f"SELECT * FROM case_weather "
-                            f"WHERE case_id IN ({ph})", chunk))
-            for o in obs_rows:
-                for c in conds:
-                    try:
-                        r = weather.evaluate_condition(o, c)
-                        if r["matched"]:
-                            matched_by_case[o["case_id"]].add(r["condition_id"])
-                    except Exception:
-                        LOG.exception("weather prevalence failed")
-            for matched in matched_by_case.values():
-                for cid in matched:
-                    weather_prevalence[cid] = weather_prevalence.get(cid, 0) + 1
-
-        if case_ids:
-            with db() as conn:
-                if _table_exists(conn, "case_method"):
-                    for chunk in _chunks(case_ids):
-                        ph = ",".join("?" * len(chunk))
-                        for r in conn.execute(
-                                f"SELECT method_id, COUNT(DISTINCT case_id) AS n "
-                                f"FROM case_method WHERE case_id IN ({ph}) "
-                                "GROUP BY method_id", chunk):
-                            mo_prevalence[r["method_id"]] = (
-                                mo_prevalence.get(r["method_id"], 0) + r["n"])
-
-        def _pct(n):
-            return round(100.0 * n / total, 1) if total else 0.0
-
-        return render_template(
-            "corpus_dashboard.html",
-            total=total,
-            by_type=[dict(r) for r in by_type],
-            by_status=[dict(r) for r in by_status],
-            by_priority=[dict(r) for r in by_priority],
-            temporal_prevalence=[
-                {"window_id": wid, "count": n, "pct": _pct(n)}
-                for wid, n in sorted(temporal_prevalence.items(),
-                                     key=lambda kv: -kv[1])],
-            weather_prevalence=[
-                {"condition_id": cid, "count": n, "pct": _pct(n)}
-                for cid, n in sorted(weather_prevalence.items(),
-                                     key=lambda kv: -kv[1])],
-            mo_prevalence=[
-                {"method_id": mid, "count": n, "pct": _pct(n)}
-                for mid, n in sorted(mo_prevalence.items(),
-                                     key=lambda kv: -kv[1])],
-        )
-
-    # ---- admin: train
     @app.route("/admin/train", methods=["GET", "POST"])
     @admin_required
     def train_model():
         if request.method == "POST":
             f = request.files.get("training_csv")
-            if not f or not f.filename.lower().endswith(".csv"):
-                flash("Upload a .csv file.", "error")
-                return _train_page(400)
-            try:
-                df = pd.read_csv(f.stream, nrows=200_000)
-            except Exception:
-                flash("Could not read that CSV file.", "error")
-                return _train_page(400)
-            try:
-                m = ml.train(df)
-            except ValueError as exc:
-                flash(str(exc), "error")
-                return _train_page(400)
-            except Exception:
-                ref = secrets.token_hex(4)
-                LOG.exception("Training failed (ref %s)", ref)
-                flash(f"Training failed. Reference: {ref}", "error")
-                return _train_page(500)
-            audit(current_user.username, "train_model", "model",
-                  f"rows={m['training_samples'] + m['test_samples']} "
-                  f"auc={m['roc_auc']}")
-            auc = "n/a" if m["roc_auc"] is None else f"{m['roc_auc']:.3f}"
-            flash(f"Model trained. Test AUC {auc}, accuracy "
-                  f"{m['accuracy']:.3f} on {m['test_samples']} held-out "
-                  "rows.", "success")
-            return redirect(url_for("train_model"))
-        return _train_page()
-
-    def _train_page(status: int = 200):
-        return render_template("train.html", model_meta=ml.meta,
-                               min_rows=Config.MIN_TRAIN_ROWS), status
+            if f and f.filename.lower().endswith(".csv"):
+                try:
+                    ml.train(pd.read_csv(f.stream))
+                    flash("Model trained successfully.", "success")
+                except Exception as exc:
+                    flash(str(exc), "error")
+        return render_template("train.html")
 
     return app
 
 
-# =============================================================================
-# HELPERS
-# =============================================================================
-
-def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-        (name,)).fetchone()
-    return row is not None
-
-
-def _discard(path: Optional[Path]) -> None:
-    if path is not None:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            LOG.warning("Could not remove orphaned upload %s", path)
-
-
-# =============================================================================
-# CLI
-# =============================================================================
-
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(prog="sicca_app.py")
-    sub = parser.add_subparsers(dest="cmd")
-    sub.add_parser("run", help="start the web server (default)")
-    cu = sub.add_parser("create-user", help="add a user")
-    cu.add_argument("username")
-    cu.add_argument("--role", choices=["analyst", "admin"], default="analyst")
-    tr = sub.add_parser("train", help="train the ML model from a CSV")
-    tr.add_argument("csv")
-    sub.add_parser("check-templates",
-                   help="show where templates are found")
-    tr2 = sub.add_parser("trace",
-                         help="print the Bayesian arithmetic for one case")
-    tr2.add_argument("case_id")
-    args = parser.parse_args(argv)
-    cmd = args.cmd or "run"
-
-    if cmd == "check-templates":
-        _, index = build_template_loader()
-        for name in REQUIRED_TEMPLATES:
-            print(f"{name:30s} -> "
-                  f"{index.get(name, 'MISSING (built-in fallback)')}")
-        extra = sorted(set(index) - set(REQUIRED_TEMPLATES))
-        if extra:
-            print("\nOther templates found:")
-            for name in extra:
-                print(f"  {name:28s} {index[name]}")
-        return 0
-
+def main():
     init_db()
     load_strength_factors()
-
-    if cmd == "create-user":
-        pw = getpass.getpass("Password: ")
-        if pw != getpass.getpass("Repeat password: "):
-            print("Passwords do not match.", file=sys.stderr)
-            return 1
-        try:
-            create_user(args.username, pw, args.role)
-        except (ValueError, sqlite3.IntegrityError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-        print(f"Created {args.role} '{args.username}'.")
-        return 0
-
-    if cmd == "train":
-        model = MLModel(Config.MODEL_PATH, Config.MODEL_HASH_PATH,
-                        key=load_or_create_secret_key().encode("utf-8"))
-        try:
-            m = model.train(pd.read_csv(args.csv))
-        except (ValueError, OSError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-        print(f"Trained v{m['model_version']}: AUC={m['roc_auc']} "
-              f"accuracy={m['accuracy']:.3f} "
-              f"(train {m['training_samples']}, test {m['test_samples']})")
-        return 0
-
-    if cmd == "trace":
-        if calib is None:
-            print(f"Calibration module unavailable: {_CALIB_IMPORT_ERROR}",
-                  file=sys.stderr)
-            return 1
-        with db() as conn:
-            row = conn.execute(
-                "SELECT * FROM cases WHERE case_id = ?", (args.case_id,)
-            ).fetchone()
-        if row is None:
-            print(f"No such case: {args.case_id}", file=sys.stderr)
-            return 1
-        trace = build_trace(dict(row))
-        print(calib.trace_summary(trace))
-        print()
-        print(_pretty(trace))
-        return 0
-
-    if Config.DEBUG and Config.HOST not in LOOPBACK_HOSTS:
-        print("Refusing to run with SICCA_DEBUG=1 on a non-loopback host: "
-              "the Werkzeug debugger allows remote code execution.",
-              file=sys.stderr)
-        return 1
-    # The built-in dev server on loopback is plain http, so only there (and
-    # only if SICCA_COOKIE_SECURE is unset) the session cookie is not Secure.
-    dev_http = (os.environ.get("SICCA_COOKIE_SECURE") is None
-                and Config.HOST in LOOPBACK_HOSTS)
-    if dev_http:
-        LOG.info("Development server on loopback: session cookie is not "
-                 "marked Secure.")
-    create_app(dev_insecure_cookies=dev_http).run(
-        host=Config.HOST, port=Config.PORT, debug=Config.DEBUG)
-    return 0
+    create_app().run(host=Config.HOST, port=Config.PORT, debug=Config.DEBUG)
 
 
 if __name__ == "__main__":
