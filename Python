@@ -1,773 +1,681 @@
-#!/usr/bin/env python3
-# =============================================================================
-# SICCA v2.3.5 - Fully Consolidated Secure Case Analysis System (All Modules Restored)
-# =============================================================================
-
-from __future__ import annotations
-
-import csv
-import io
-import json
-import logging
-import os
-import re
-import secrets
-import sqlite3
-import sys
-from contextlib import contextmanager
-from datetime import datetime, timezone
-from functools import wraps
-from itertools import combinations
-from logging.handlers import RotatingFileHandler
-from math import isfinite
-from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
-
-import joblib
-import pandas as pd
-
-from flask import (
-    Flask, abort, flash, jsonify, redirect, render_template, request,
-    session, url_for, Response
-)
-from flask_login import (
-    LoginManager, UserMixin, current_user, login_required, login_user,
-    logout_user,
-)
-from flask_wtf import CSRFProtect
-from jinja2 import ChoiceLoader, DictLoader
-from werkzeug.security import check_password_hash, generate_password_hash
-from werkzeug.utils import secure_filename
-
-# =============================================================================
-# ADVANCED OPTIONAL MODULES (Graceful Degradation)
-# =============================================================================
-try:
-    import sicca_calibration as calib
-except Exception as _calib_exc:
-    calib = None
-    _CALIB_IMPORT_ERROR = str(_calib_exc)
-else:
-    _CALIB_IMPORT_ERROR = ""
-
-try:
-    import sicca_temporal as temporal
-except Exception as _temporal_exc:
-    temporal = None
-    _TEMPORAL_IMPORT_ERROR = str(_temporal_exc)
-else:
-    _TEMPORAL_IMPORT_ERROR = ""
-
-try:
-    import sicca_weather as weather
-except Exception as _weather_exc:
-    weather = None
-    _WEATHER_IMPORT_ERROR = str(_weather_exc)
-else:
-    _WEATHER_IMPORT_ERROR = ""
-
-try:
-    import sicca_mo as mo
-except Exception as _mo_exc:
-    mo = None
-    _MO_IMPORT_ERROR = str(_mo_exc)
-else:
-    _MO_IMPORT_ERROR = ""
-
-try:
-    import sicca_linkage as linkage
-except Exception as _linkage_exc:
-    linkage = None
-    _LINKAGE_IMPORT_ERROR = str(_linkage_exc)
-else:
-    _LINKAGE_IMPORT_ERROR = ""
-
-try:
-    import sicca_conditions as conditions
-except Exception as _conditions_exc:
-    conditions = None
-    _CONDITIONS_IMPORT_ERROR = str(_conditions_exc)
-else:
-    _CONDITIONS_IMPORT_ERROR = ""
-
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-class Config:
-    APP_ROOT = Path(os.environ.get("SICCA_APP_ROOT", Path(__file__).resolve().parent)).resolve()
-    BASE_DIR = Path(os.environ.get("SICCA_BASE_DIR", APP_ROOT / "sicca_data")).resolve()
-    CASES_DB = BASE_DIR / "sicca.db"
-    LOGS_DIR = BASE_DIR / "logs"
-    UPLOADS_DIR = BASE_DIR / "uploads"
-    MODELS_DIR = BASE_DIR / "models"
-
-    MAX_CONTENT_LENGTH = 10 * 1024 * 1024
-    MODEL_PATH = MODELS_DIR / "sicca_pipeline.joblib"
-    MODEL_HASH_PATH = MODELS_DIR / "sicca_pipeline.joblib.hmac"
-    MODEL_VERSION = "2.3.5"
-
-    HOST = os.environ.get("SICCA_HOST", "127.0.0.1")
-    PORT = int(os.environ.get("SICCA_PORT", "5001"))
-    DEBUG = os.environ.get("SICCA_DEBUG", "1") == "1"
-
-    @classmethod
-    def ensure_dirs(cls) -> None:
-        for d in (cls.BASE_DIR, cls.LOGS_DIR, cls.UPLOADS_DIR, cls.MODELS_DIR):
-            d.mkdir(parents=True, exist_ok=True)
-
-
-def load_or_create_secret_key() -> str:
-    env = os.environ.get("SICCA_SECRET_KEY")
-    if env:
-        return env
-    Config.BASE_DIR.mkdir(parents=True, exist_ok=True)
-    keyfile = Config.BASE_DIR / "secret.key"
-    if keyfile.exists():
-        key = keyfile.read_text().strip()
-        if key:
-            return key
-    key = secrets.token_hex(32)
-    keyfile.write_text(key)
-    return key
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-# =============================================================================
-# LOGGING & DATABASE
-# =============================================================================
-
-def configure_logging() -> logging.Logger:
-    Config.ensure_dirs()
-    logger = logging.getLogger("sicca")
-    logger.setLevel(logging.INFO)
-    if logger.handlers:
-        return logger
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-    fh = RotatingFileHandler(Config.LOGS_DIR / "sicca.log", maxBytes=10 * 1024 * 1024, backupCount=5)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
-    return logger
-
-
+﻿#!/usr/bin/env python3 """ SICCA v3.0 - Secure Case Analysis System Transparent Bayesian cross-case linkage estimator (no fake scores, no dummy ML). Run:  pip install flask flask-login flask-wtf pandas && python sicca_app.py
+Fully offline. No CDN, no telemetry, no external network calls. (c) 2026 CBNexGenSoftware. SICCA by C.B. Smith. All rights reserved. """ from future import annotations import csv, hashlib, hmac, io, json, logging, math, os, random, re, secrets, sqlite3, sys, time from contextlib import contextmanager from datetime import datetime, timezone from itertools import combinations from logging.handlers import RotatingFileHandler from pathlib import Path from typing import Any, Dict, List, Optional
+import pandas as pd from flask import Flask, Response, abort, flash, redirect, render_template, request, session, url_for from flask_login import LoginManager, UserMixin, current_user, login_required, login_user, logout_user from flask_wtf import CSRFProtect from jinja2 import DictLoader from werkzeug.security import check_password_hash, generate_password_hash from werkzeug.utils import secure_filename
+============================== CONFIG ==============================
+class Config: APP_ROOT = Path(os.environ.get("SICCA_APP_ROOT", Path(file).resolve().parent)).resolve() BASE_DIR = Path(os.environ.get("SICCA_BASE_DIR", APP_ROOT / "sicca_data")).resolve() DB = BASE_DIR / "sicca.db" LOGS = BASE_DIR / "logs" MODEL = BASE_DIR / "calibration.json" MAX_CONTENT_LENGTH = 5 * 1024 * 1024 VERSION = "3.0.0" HOST = os.environ.get("SICCA_HOST", "127.0.0.1") PORT = int(os.environ.get("SICCA_PORT", "5001")) DEBUG = os.environ.get("SICCA_DEBUG", "0") == "1" SECURE_COOKIE = os.environ.get("SICCA_SECURE_COOKIE", "0") == "1" DEFAULT_PRIOR = 0.02 MC_SAMPLES = 2000 COPYRIGHT = "(c) 2026 CBNexGenSoftware. SICCA by C.B. Smith. All rights reserved."
+def ensure_dirs() -> None: for d in (Config.BASE_DIR, Config.LOGS): d.mkdir(parents=True, exist_ok=True)
+def secret_key() -> str: env = os.environ.get("SICCA_SECRET_KEY") if env: return env ensure_dirs() f = Config.BASE_DIR / "secret.key" if f.exists() and f.read_text().strip(): return f.read_text().strip() k = secrets.token_hex(32) f.write_text(k) try: os.chmod(f, 0o600) except OSError: pass return k
+def now_iso() -> str: return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def configure_logging() -> logging.Logger: ensure_dirs() lg = logging.getLogger("sicca") lg.setLevel(logging.INFO) if not lg.handlers: fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s") for h in (RotatingFileHandler(Config.LOGS / "sicca.log", maxBytes=5_000_000, backupCount=3), logging.StreamHandler(sys.stdout)): h.setFormatter(fmt) lg.addHandler(h) return lg
 LOG = configure_logging()
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    role     TEXT NOT NULL DEFAULT 'analyst'
-);
-
-CREATE TABLE IF NOT EXISTS cases (
-    case_id            TEXT PRIMARY KEY,
-    case_name          TEXT NOT NULL,
-    location           TEXT NOT NULL,
-    year               INTEGER NOT NULL,
-    type               TEXT NOT NULL,
-    status             TEXT NOT NULL,
-    confidence         REAL NOT NULL,
-    suspects_count     INTEGER NOT NULL,
-    evidence_count     INTEGER NOT NULL,
-    evidence_strength  TEXT NOT NULL DEFAULT 'moderate',
-    description        TEXT NOT NULL DEFAULT '',
-    priority           TEXT NOT NULL DEFAULT 'medium',
-    assigned_to        TEXT NOT NULL DEFAULT '',
-    tags               TEXT NOT NULL DEFAULT '',
-    created_by         TEXT NOT NULL DEFAULT '',
-    created            TEXT NOT NULL,
-    modified           TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS suspects (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    case_id    TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
-    name       TEXT NOT NULL,
-    role       TEXT NOT NULL DEFAULT 'suspect',
-    created    TEXT NOT NULL
-);
-"""
-
-
-@contextmanager
-def db():
-    conn = sqlite3.connect(Config.CASES_DB, timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def create_user(username: str, password: str, role: str = "analyst") -> None:
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO users (username, password, role) VALUES (?,?,?)",
-            (username, generate_password_hash(password), role),
-        )
-
-
-def init_db() -> None:
-    Config.ensure_dirs()
-    with db() as conn:
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.executescript(SCHEMA)
-        n_users = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
-        if n_users:
-            return
-    username = os.environ.get("SICCA_ADMIN_USER", "admin")
-    password = os.environ.get("SICCA_ADMIN_PASS") or secrets.token_urlsafe(14)
-    try:
-        create_user(username, password, "admin")
-    except sqlite3.IntegrityError:
-        return
-    print(f"\n*** SICCA initial admin login ***\n user: {username}\n pass: {password}\n", file=sys.stderr)
-
-
-# =============================================================================
-# AUTHENTICATION
-# =============================================================================
-
-class User(UserMixin):
-    def __init__(self, uid: int, username: str, role: str):
-        self.id = str(uid)
-        self.username = username
-        self.role = role
-
-    def is_admin(self) -> bool:
-        return self.role == "admin"
-
-
+============================== DATABASE ==============================
+SCHEMA = """ CREATE TABLE IF NOT EXISTS users( id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'analyst'); CREATE TABLE IF NOT EXISTS cases( case_id TEXT PRIMARY KEY, case_name TEXT NOT NULL, location TEXT NOT NULL DEFAULT '', year INTEGER NOT NULL, type TEXT NOT NULL, status TEXT NOT NULL, priority TEXT NOT NULL DEFAULT 'medium', confidence REAL NOT NULL DEFAULT 0.5, description TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, modified TEXT NOT NULL); CREATE TABLE IF NOT EXISTS victims( id INTEGER PRIMARY KEY AUTOINCREMENT, case_id TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE, name TEXT NOT NULL, sex TEXT NOT NULL DEFAULT 'U', age INTEGER); CREATE TABLE IF NOT EXISTS link_evidence( id INTEGER PRIMARY KEY AUTOINCREMENT, case_a TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE, case_b TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE, category TEXT NOT NULL, description TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, reliability REAL NOT NULL, lr REAL NOT NULL, grp TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL DEFAULT '', created TEXT NOT NULL); """
+@contextmanager def db(): conn = sqlite3.connect(str(Config.DB), timeout=15) conn.row_factory = sqlite3.Row conn.execute("PRAGMA foreign_keys = ON") try: yield conn conn.commit() except Exception: conn.rollback() raise finally: conn.close()
+def init_db() -> None: ensure_dirs() with db() as c: c.execute("PRAGMA journal_mode = WAL") c.executescript(SCHEMA) if c.execute("SELECT COUNT() n FROM users").fetchone()["n"]: return user = os.environ.get("SICCA_ADMIN_USER", "admin") pw = os.environ.get("SICCA_ADMIN_PASS") or secrets.token_urlsafe(14) c.execute("INSERT INTO users(username,password,role) VALUES(?,?,?)", (user, generate_password_hash(pw), "admin")) print(f"\n** SICCA initial admin login ***\n user: {user}\n pass: {pw}\n", file=sys.stderr)
+CASE_TYPES = ("fraud", "homicide", "robbery", "arson", "burglary", "assault", "theft", "vandalism", "unknown") STATUSES = ("open", "under investigation", "pending trial", "closed", "unsolved") PRIORITIES = ("low", "medium", "high")
+def clean(v: Any, n: int = 1000) -> str: return "" if v is None else str(v).replace("\x00", "").strip()[:n]
+def pick(v: Any, allowed, default: str) -> str: v = clean(v, 50).lower() return v if v in allowed else default
+def safe_cell(v: Any) -> str: s = "" if v is None else str(v) return "'" + s if s and s[0] in "=+-@\t\r" else s
+============================== AUTH ==============================
+class User(UserMixin): def init(self, uid, username, role): self.id, self.username, self.role = str(uid), username, role
+def is_admin(self) -> bool:
+    return self.role == "admin"
 login_manager = LoginManager()
+@login_manager.user_loader def load_user(uid: str) -> Optional[User]: with db() as c: r = c.execute("SELECT id,username,role FROM users WHERE id=?", (uid,)).fetchone() return User(r["id"], r["username"], r["role"]) if r else None
+FAILS: Dict[str, List[float]] = {}
+def locked_out(key: str) -> bool: t = time.time() FAILS[key] = [x for x in FAILS.get(key, []) if t - x < 600] return len(FAILS[key]) >= 5
+============================== LINKAGE ENGINE ==============================
+CATEGORIES = { "forensic_match": (10.0, "Forensic or physical match (DNA, tool marks, shared object)"), "shared_person": (8.0, "Same person verified as involved in both cases"), "method_match": (3.0, "Distinctive method or signature in common"), "shared_place": (2.0, "Same specific place (a bar, a building, a vehicle)"), "witness_overlap": (2.0, "Witness account connects the two cases"), "shared_region": (1.5, "Same wider region or terrain"), "victim_profile": (1.2, "Similar victim profile"), "coincidence": (1.0, "Date, name or number coincidence (no mechanism)"), "time_gap": (0.7, "Long gap between the crimes"), "contradiction": (0.3, "Evidence that points away from a link"), } STATUS_W = {"verified": 1.0, "witness": 0.5, "unverified": 0.25, "disputed": 0.1}
+def effective(it: Dict[str, Any]) -> Dict[str, Any]: w = STATUS_W.get(it["status"], 0.25) * max(0.0, min(1.0, float(it["reliability"]))) it["w"] = w it["elr"] = math.exp(math.log(max(float(it["lr"]), 1e-6)) * w) return it
+def group_best(items: List[Dict[str, Any]]) -> Dict[str, tuple]: best: Dict[str, tuple] = {} for i, it in enumerate(items): key = it.get("grp") or f"_item{i}" ll = math.log(it["elr"]) if key not in best or abs(ll) > abs(best[key][0]): best[key] = (ll, i) return best
+def to_p(prior: float, sum_log: float) -> float: odds = prior / (1 - prior) * math.exp(max(-50.0, min(50.0, sum_log))) return odds / (1 + odds)
+def assess(items: List[Dict[str, Any]], prior: float, seed: str = "") -> Dict[str, Any]: items = [effective(dict(i)) for i in items] best = group_best(items) total = sum(v[0] for v in best.values()) post = to_p(prior, total) rng = random.Random(seed) sds = {k: 0.15 + 0.5 * (1 - items[v[1]]["w"]) for k, v in best.items()} samples = [] for _ in range(Config.MC_SAMPLES): pr = min(0.9, max(1e-4, prior * math.exp(rng.gauss(0, 0.5)))) samples.append(to_p(pr, sum(v[0] + rng.gauss(0, sds[k]) for k, v in best.items()))) samples.sort() sens = [] for k, v in best.items(): it = items[v[1]] sens.append({"desc": it["description"], "delta": post - to_p(prior, total - v[0]), "counted": True}) sens.sort(key=lambda s: -abs(s["delta"])) counted = {v[1] for v in best.values()} for i, it in enumerate(items): it["counted"] = i in counted return {"items": items, "total_log": total, "combined_lr": math.exp(max(-50, min(50, total))), "prior": prior, "post": post, "p5": samples[int(0.05 * len(samples))], "p95": samples[int(0.95 * len(samples)) - 1], "sens": sens}
+def tokens(s: str) -> set: return {t for t in re.findall(r"[a-zà-ÿ]{4,}", (s or "").lower())}
+def auto_items(a: Dict[str, Any], b: Dict[str, Any]) -> List[Dict[str, Any]]: out = [] base = {"source": "case records", "status": "verified", "reliability": 0.5, "auto": True, "id": None} if a["type"] == b["type"] and a["type"] != "unknown": out.append({**base, "category": "victim_profile", "lr": 1.2, "grp": "auto_type", "description": f"Same crime type ({a['type']})"}) shared = tokens(a["location"]) & tokens(b["location"]) if shared: out.append({**base, "category": "shared_region", "lr": CATEGORIES["shared_region"][0], "grp": "auto_region", "description": "Location text overlap: " + ", ".join(sorted(shared))}) gap = abs(int(a["year"]) - int(b["year"])) if gap > 3: out.append({**base, "category": "time_gap", "lr": 0.7, "grp": "auto_time", "reliability": 1.0, "description": f"{gap} years between the cases"}) return out
+def pair_items(conn, a: Dict[str, Any], b: Dict[str, Any]) -> List[Dict[str, Any]]: x, y = sorted((a["case_id"], b["case_id"])) rows = conn.execute("SELECT * FROM link_evidence WHERE case_a=? AND case_b=? ORDER BY id", (x, y)).fetchall() return auto_items(a, b) + [dict(r, auto=False) for r in rows]
+def baseline(conn, total_log: float) -> Dict[str, Any]: cases = [dict(r) for r in conn.execute("SELECT * FROM cases").fetchall()] scores = [] for a, b in combinations(cases, 2): it = [effective(dict(i)) for i in pair_items(conn, a, b)] scores.append(sum(v[0] for v in group_best(it).values()) if it else 0.0) n = len(scores) below = sum(1 for s in scores if s < total_log - 1e-9) return {"n": n, "pct": (100.0 * below / n) if n else None}
+def pairwise_scores(conn, prior: float) -> Dict[tuple, Dict[str, Any]]: """Compute assess() for every pair of cases. Used by the matrix and graph views.""" cases = [dict(r) for r in conn.execute("SELECT * FROM cases").fetchall()] out: Dict[tuple, Dict[str, Any]] = {} for a, b in combinations(cases, 2): key = tuple(sorted((a["case_id"], b["case_id"]))) try: out[key] = assess(pair_items(conn, a, b), prior, seed="|".join(key)) except Exception as e: LOG.warning("pairwise assess failed for %s: %s", key, e) return out
+NUMWORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+def fact_check(case: Dict[str, Any], victims: List[Dict[str, Any]]) -> List[str]: out, text, n = [], (case["description"] or "").lower(), len(victims) sexes = {v["sex"] for v in victims} if not n: out.append("No victims recorded; comparisons on victim profile are unsupported.") if (re.search(r"\b(three|two|four|all|\d+)\s+(teenage\s+)?(female|girls|women)\b", text) and "M" in sexes and not re.search(r"\b(boy|boys|male|man|men)\b", text)): out.append("Description says the victims are female, but a male victim is recorded.") m = re.search(r"\b(one|two|three|four|five|six|\d+)\s+(teenage\s+|young\s+)?(victims|teenagers|minors|children)\b", text) if m and n: claimed = NUMWORDS.get(m.group(1)) or int(m.group(1)) if claimed != n: out.append(f"Description mentions {claimed} victims but {n} are recorded.") for v in victims: if v["age"] is not None and not 0 <= v["age"] <= 110: out.append(f"Implausible age for {v['name']}.") return out
+def _sig(payload: str) -> str: return hmac.new(secret_key().encode(), payload.encode(), hashlib.sha256).hexdigest()
+def load_calibration() -> Optional[Dict[str, Any]]: try: raw = json.loads(Config.MODEL.read_text()) body = json.dumps(raw["model"], sort_keys=True) return raw["model"] if hmac.compare_digest(raw["sig"], _sig(body)) else None except (OSError, KeyError, ValueError): return None
+def train_calibration(df: pd.DataFrame) -> Dict[str, Any]: if not {"log_odds", "label"} <= set(df.columns): raise ValueError("CSV needs columns: log_odds, label") df = df"log_odds", "label".dropna().astype(float) if len(df) < 30 or df["label"].nunique() < 2 or not set(df["label"]) <= {0.0, 1.0}: raise ValueError("Need at least 30 rows with labels 0 and 1 (both present).") xs, ys = df["log_odds"].tolist(), df["label"].tolist() a, b = 1.0, 0.0 for _ in range(3000): ga = gb = 0.0 for x, y in zip(xs, ys): p = 1 / (1 + math.exp(-max(-30, min(30, a * x + b)))) ga += (p - y) * x gb += p - y a -= 0.05 * ga / len(xs) b -= 0.05 * gb / len(xs) brier = sum((1 / (1 + math.exp(-(a * x + b))) - y) ** 2 for x, y in zip(xs, ys)) / len(xs) model = {"a": a, "b": b, "n": len(xs), "brier_in_sample": brier, "trained": now_iso()} Config.MODEL.write_text(json.dumps({"model": model, "sig": _sig(json.dumps(model, sort_keys=True))})) return model
+def calibrated(post: float, model: Optional[Dict[str, Any]]) -> Optional[float]: if not model: return None p = min(1 - 1e-9, max(1e-9, post)) return 1 / (1 + math.exp(-(model["a"] * math.log(p / (1 - p)) + model["b"])))
+============================== TEMPLATES ==============================
+CSRF = '' CSS = """:root{--bg:#0f172a;--card:#1e293b;--line:#334155;--text:#f1f5f9;--muted:#94a3b8;--blue:#3b82f6;--red:#ef4444;--green:#22c55e;--amber:#f59e0b} *{box-sizing:border-box}body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);margin:0;line-height:1.55} header{background:var(--card);border-bottom:1px solid var(--line);padding:.7rem 1.5rem;display:flex;flex-wrap:wrap;gap:1rem;justify-content:space-between;align-items:center} .logo{font-weight:700;font-size:1.2rem}nav{display:flex;flex-wrap:wrap;gap:.3rem}nav a{color:var(--muted);text-decoration:none;padding:.35rem .7rem;border-radius:6px;font-size:.9rem} nav a:hover,nav a.on{color:var(--text);background:rgba(59,130,246,.18)}main{max-width:1150px;margin:1.5rem auto;padding:0 1rem} .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:1.3rem;margin-bottom:1.2rem} table{width:100%;border-collapse:collapse;margin:.6rem 0;font-size:.88rem}th,td{padding:.5rem .7rem;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted)} a{color:#60a5fa}.btn{background:var(--blue);color:#fff;padding:.5rem 1rem;border:0;border-radius:6px;cursor:pointer;text-decoration:none;font-size:.9rem;display:inline-block} .btn.alt{background:#475569}.btn.ok{background:#16a34a}.btn.del{background:#b91c1c;padding:.2rem .6rem} input,select,textarea{width:100%;background:#0b1220;border:1px solid var(--line);color:#fff;padding:.55rem;border-radius:6px;margin:.25rem 0 .8rem} label{font-size:.85rem;color:var(--muted);display:block}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1rem} .metric{border-left:4px solid var(--blue);background:#0b1220;padding:.8rem 1rem;border-radius:6px}.metric b{font-size:1.6rem;display:block} .flash{padding:.7rem 1rem;border-radius:6px;margin-bottom:1rem;background:rgba(34,197,94,.2)}.flash.error{background:rgba(239,68,68,.2)} .warn{background:rgba(245,158,11,.15);border:1px solid var(--amber);padding:.6rem 1rem;border-radius:6px;margin:.5rem 0} .muted{color:var(--muted)}code{background:#0b1220;padding:.1rem .35rem;border-radius:4px}.box{background:#0b1220;border:1px solid var(--line);border-radius:6px;padding:.8rem 1rem;margin:.8rem 0} h2,h3{margin-top:1.4rem}.cols{display:grid;grid-template-columns:1fr 1fr;gap:1.2rem}@media(max-width:800px){.cols{grid-template-columns:1fr}} footer{text-align:center;color:var(--muted);font-size:.8rem;padding:1.5rem} footer .copy{margin-top:.4rem;font-size:.78rem;color:#64748b} .matrix td,.matrix th{padding:.35rem .4rem} #graph{position:relative;height:650px;background:#0b1220;border-radius:6px;overflow:hidden} #graph svg{width:100%;height:100%;display:block} #graph .edge{stroke-linecap:round} #graph text{fill:#f1f5f9;font-size:12px;pointer-events:none} #graph circle{cursor:pointer;stroke:#0b1220;stroke-width:2} #graph circle:hover{stroke:#fff} #graph line{cursor:pointer}"""
+BASE = ("""
+SICCA
+{% if current_user.is_authenticated %} {% for ep,lbl in [('dashboard','Dashboard'),('create_case','Create Case'),('compare','Network'),('matrix','Matrix'),('network_graph','Graph'),('evidence_library','Evidence'),('export_cases','Export'),('train_model','Train ML'),('how_it_works','How It Works')] %} {{ lbl }}{% endfor %} 
+""" + CSRF + """Logout ({{ current_user.username }})
+{% endif %} {% for cat,m in get_flashed_messages(with_categories=true) %}
+{{ m }}
+{% endfor %} {% block body %}{% endblock %} SICCA v""" + Config.VERSION + """ - estimates are decision aids, not evidence. 
+""" + Config.COPYRIGHT + """
+""") 
+T: Dict[str, str] = {"_base.html": BASE}
+T["login.html"] = """{% extends "_base.html" %}{% block body %}SICCA login
+""" + CSRF + """ 
+{% endblock %}""" 
+T["dashboard.html"] = """{% extends "_base.html" %}{% block body %}Case dashboard
+Total cases{{ s.total }}
+Unsolved or open{{ s.open }}
+High priority{{ s.high }}
+Evidence items{{ s.evidence }}
+Recent cases
+ID	Name	Type	Location	Year	Status	Priority {% for c in cases %}
+{{ c.case_id }}	{{ c.case_name }}	{{ c.type }}	{{ c.location }}	{{ c.year }}	{{ c.status }}	{{ c.priority }} {% else %}
+No cases yet. Create one or import a CSV.{% endfor %}
+{% endblock %}""" 
+T["create_case.html"] = """{% extends "_base.html" %}{% block body %}Create case""" + CSRF + """ Case ID *Case name * LocationYear Type{% for t in types %}{{ t }}{% endfor %} Status{% for t in statuses %}{{ t }}{% endfor %} Priority{% for t in priorities %}{{ t }}{% endfor %} DescriptionCreate case
 
-
-@login_manager.user_loader
-def load_user(uid: str) -> Optional[User]:
-    with db() as conn:
-        row = conn.execute("SELECT id, username, role FROM users WHERE id = ?", (uid,)).fetchone()
-    return User(row["id"], row["username"], row["role"]) if row else None
-
-
-CASE_TYPES = ("fraud", "homicide", "robbery", "arson", "burglary", "assault", "theft", "vandalism", "unknown")
-STATUSES = ("open", "under investigation", "pending trial", "closed")
-PRIORITIES = ("low", "medium", "high")
-
-
-def clean_text(value: Any, max_len: int = 1000) -> str:
-    if value is None:
-        return ""
-    return str(value).replace("\x00", "").strip()[:max_len]
-
-
-# =============================================================================
-# ML & HEURISTIC ENGINE
-# =============================================================================
-
-class MLModel:
-    def __init__(self, path: Path, hash_path: Path):
-        self.path = path
-        self.hash_path = hash_path
-
-    def exists(self) -> bool:
-        return self.path.exists()
-
-    def predict_one(self, case: Mapping[str, Any]) -> Tuple[Optional[float], str]:
-        if not self.exists():
-            return None, "Model not trained."
-        return 0.75, ""
-
-    def train(self, df: pd.DataFrame) -> Dict[str, Any]:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_bytes(b"dummy")
-        self.hash_path.write_bytes(b"dummy_hash")
-        return {"accuracy": 0.92, "roc_auc": 0.89}
-
-
-# =============================================================================
-# TEMPLATES (Dark-Blue Theme Matching Reference Video)
-# =============================================================================
-
-_CSRF = '<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">'
-
-FALLBACK_TEMPLATES = {
-    "_fallback_base.html": """<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><title>SICCA - Secure Case Analysis System</title>
-<style>
-:root{--bg-dark:#0f172a;--bg-card:#1e293b;--border-color:#334155;--text-main:#f8fafc;--text-muted:#94a3b8;--accent-blue:#3b82f6;--accent-hover:#2563eb;--danger:#ef4444;--success:#22c55e;--warning:#f59e0b}
-body{font-family:system-ui,-apple-system,sans-serif;background-color:var(--bg-dark);color:var(--text-main);margin:0;padding:0;min-height:100vh}
-header{background:var(--bg-card);border-bottom:1px solid var(--border-color);padding:0.75rem 2rem;display:flex;justify-content:space-between;align-items:center}
-.logo{font-weight:700;font-size:1.25rem;letter-spacing:0.05em;color:var(--text-main);display:flex;align-items:center;gap:.5rem}
-nav{display:flex;gap:.5rem;align-items:center}
-nav a{color:var(--text-muted);text-decoration:none;padding:.4rem .8rem;border-radius:6px;font-size:.9rem;transition:all .2s}
-nav a:hover,nav a.active{color:var(--text-main);background:rgba(59,130,246,0.15)}
-.container{max-width:1200px;margin:2rem auto;padding:0 1.5rem}
-.card{background:var(--bg-card);border:1px solid var(--border-color);border-radius:8px;padding:1.5rem;margin-bottom:1.5rem}
-table{width:100%;border-collapse:collapse;margin-top:1rem}
-th,td{padding:.75rem 1rem;text-align:left;border-bottom:1px solid var(--border-color);font-size:.9rem}
-th{color:var(--text-muted);font-weight:600}
-td a{color:var(--accent-blue);text-decoration:none}
-td a:hover{text-decoration:underline}
-.btn{background:var(--accent-blue);color:#fff;padding:.5rem 1rem;border:none;border-radius:6px;cursor:pointer;font-weight:500;display:inline-flex;align-items:center;gap:.5rem;text-decoration:none}
-.btn:hover{background:var(--accent-hover)}
-.btn-success{background:var(--success)}
-.badge{padding:.2rem .6rem;border-radius:4px;font-size:.75rem;font-weight:600;text-transform:uppercase}
-.badge-open{background:rgba(239,68,68,0.2);color:#fca5a5}
-.badge-medium{background:rgba(245,158,11,0.2);color:#fde68a}
-input,select,textarea{width:100%;background:#0f172a;border:1px solid var(--border-color);color:#fff;padding:.6rem;border-radius:6px;margin-top:.3rem;margin-bottom:1rem;box-sizing:border-box}
-label{font-size:.85rem;color:var(--text-muted);display:block}
-.metrics-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem;margin-bottom:1.5rem}
-.metric-card{background:var(--bg-card);border:1px solid var(--border-color);border-radius:8px;padding:1.2rem;border-left:4px solid var(--accent-blue)}
-.metric-num{font-size:1.8rem;font-weight:700;margin-top:.3rem}
-.flash{padding:.75rem 1rem;margin-bottom:1rem;border-radius:6px;background:rgba(34,197,94,0.2);color:#86efac}
-.flash.error{background:rgba(239,68,68,0.2);color:#fca5a5}
-footer{border-top:1px solid var(--border-color);padding:1.5rem;text-align:center;color:var(--text-muted);font-size:.8rem}
-</style></head><body>
-<header>
-<div class="logo">🛡️ SICCA</div>
-{% if current_user.is_authenticated %}
-<nav>
-<a href="{{ url_for('dashboard') }}" {% if request.endpoint == 'dashboard' %}class="active"{% endif %}>Dashboard</a>
-<a href="{{ url_for('create_case') }}" {% if request.endpoint == 'create_case' %}class="active"{% endif %}>Create Case</a>
-<a href="{{ url_for('cross_match_route') }}" {% if request.endpoint == 'cross_match_route' %}class="active"{% endif %}>Network</a>
-<a href="{{ url_for('export_cases') }}" {% if request.endpoint == 'export_cases' %}class="active"{% endif %}>Export</a>
-<a href="{{ url_for('train_model') }}" {% if request.endpoint == 'train_model' %}class="active"{% endif %}>Train ML</a>
-<a href="{{ url_for('how_it_works') }}" {% if request.endpoint == 'how_it_works' %}class="active"{% endif %}>How It Works</a>
-</nav>
-<form method="post" action="{{ url_for('logout') }}" style="display:inline;">""" + _CSRF + """
-<button class="btn" style="padding:.3rem .7rem;font-size:.85rem;">Logout ({{ current_user.username }})</button></form>
+Import CSV
+Columns: case_id,case_name,location,year,type,status,priority,description. Invalid rows are skipped and reported; existing IDs are never overwritten.
+""" + CSRF + """
+{% endblock %}""" 
+T["view_case.html"] = """{% extends "_base.html" %}{% block body %}{{ c.case_id }}: {{ c.case_name }}
+Type {{ c.type }} | Location {{ c.location }} | Year {{ c.year }} | Status {{ c.status }} | Priority {{ c.priority }}
+{{ c.description or 'No description.' }}
+{% for w in warns %}
+{{ w }}
+{% endfor %}
+Victims
+Name	Sex	Age {% for v in victims %}
+{{ v.name }}	{{ v.sex }}	{{ v.age if v.age is not none else '-' }}{% else %}
+None recorded.{% endfor %}
+""" + CSRF + """  
+Next steps
+Compare with another case
+Export JSON
+{% endblock %}""" 
+T["compare.html"] = """{% extends "_base.html" %}{% block body %}Network and cross-case linkage
+ 
+ 
+The prior is your starting belief before any specific evidence. See Train ML for how it is used.
+{% if error %}
+{{ error }}
 {% endif %}
-</header>
-<div class="container">
-{% with msgs = get_flashed_messages(with_categories=true) %}{% for cat, m in msgs %}
-<div class="flash {{ cat }}">{{ m }}</div>{% endfor %}{% endwith %}
-{% block body %}{% endblock %}
-</div>
-<footer>Intellectual Property Notice: Secure Case Analysis System (SICCA) &bull; Local Environment Engine</footer>
-</body></html>""",
+{% if r %}
+{{ A.case_id }} and {{ B.case_id }}
+Estimate (subjective Bayesian){{ '%.1f'|format(r.post*100) }}%
+90% interval{{ '%.1f'|format(r.p5*100) }}% to {{ '%.1f'|format(r.p95*100) }}%
+Combined likelihood ratio{{ '%.2f'|format(r.combined_lr) }}x
+{% if cal is not none %}
+Calibrated{{ '%.1f'|format(cal*100) }}%
+{% endif %} 
+Rank among all pairs{% if base.n >= 10 %}{{ '%.0f'|format(base.pct) }}th pct{% else %}n/a{% endif %}
+{% if base.n < 10 %}
+Only {{ base.n }} case pair(s) in the database, so there is no meaningful random baseline yet.
+{% endif %} {% if not cal_on %}
+Not calibrated: no labelled data has been used. Treat the percentage as a structured opinion, not a measured frequency.
+{% endif %} {% for w in warns %}
+{{ w }}
+{% endfor %} 
+Evidence used
+Category	Description	Status	Reliab.	LR	Effective LR	Group	Counted	{% for i in r['items'] %}
+{{ i.category }}	{{ i.description }}
+{{ i.source }}	{{ i.status }}	{{ i.reliability }}	{{ '%.2f'|format(i.lr) }}	{{ '%.2f'|format(i.elr) }}	{{ i.grp or '-' }}	{{ 'yes' if i.counted else 'no (group)' }}	{% if not i.auto %}
+""" + CSRF + """
+{% else %}auto{% endif %}{% endfor %}
+Sensitivity: how much each counted item moves the estimate
+Item	Change in estimate if removed {% for s in r.sens %}
+{{ s.desc }}	{{ '%+.2f'|format(s.delta*100) }} percentage points{% endfor %}
+Add evidence for this pair
+""" + CSRF + """ 
+ 
+  
+{% endif %}{% endblock %}""" 
+T["matrix.html"] = """{% extends "_base.html" %}{% block body %}Cross-case matrix
+ 
+ 
+Rows are sorted by each case's strongest link. Click any cell to open the full comparison.
+{% for c in cases %}	{{ c.case_id }}{% endfor %} {% for a in cases %} 		
+{{ a.case_id }}
+{{ a.case_name[:30] }} {% for b in cases %} {% if a.case_id == b.case_id %} 	{% else %} {% set k = (a.case_id, b.case_id) if a.case_id < b.case_id else (b.case_id, a.case_id) %} {% set v = cell.get(k) %} {% if v and v.pct >= floor %} {% set hue = 120 * (1 - (v.pct / (global_max if global_max > 0 else 1))) %} 	{{ '%.1f'|format(v.pct) }}
+{{ '%.2f'|format(v.lr) }}x {% else %} 	- {% endif %} {% endif %} {% endfor %} {% endfor %} 
+Legend
+Green cells = high posterior. Each cell shows the estimate and combined LR. Click a cell for the full breakdown.
+Cells below {{ '%.1f'|format(floor) }}% are hidden. Global maximum in this dataset: {{ '%.1f'|format(global_max) }}%.
+{% endblock %}""" 
+T["network_graph.html"] = """{% extends "_base.html" %}{% block body %}Case network graph
+ 
+ 
+{{ n_nodes }} case(s), {{ n_edges }} link(s) above threshold. Click a node to open the case; click an edge to open the pairwise comparison.
 
-    "login.html": """{% extends "_fallback_base.html" %}{% block body %}
-<div style="max-width:400px;margin:4rem auto;" class="card">
-<h2>SICCA Login</h2>
-<form method="post">""" + _CSRF + """
-<label>Username</label><input name="username" required>
-<label>Password</label><input name="password" type="password" required>
-<button class="btn" style="width:100%;justify-content:center;margin-top:1rem;">Log In</button>
-</form></div>{% endblock %}""",
+Fully offline: this graph is drawn with inline SVG and vanilla JavaScript. No external files are loaded.
+Legend
+Node color = crime type. Node size = number of connections above threshold. Edge thickness/color = posterior strength (green = strong, red = weak). Hover for details.
 
-    "dashboard.html": """{% extends "_fallback_base.html" %}{% block body %}
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;">
-<h1>Case Management Dashboard</h1>
-<div>
-<a href="{{ url_for('create_case') }}" class="btn">＋ Create New Case</a>
-<a href="{{ url_for('export_cases') }}" class="btn" style="background:#475569;margin-left:.5rem;">📥 Export Cases</a>
-</div>
-</div>
-<div class="metrics-grid">
-<div class="metric-card"><label>TOTAL CASES</label><div class="metric-num">{{ stats.total_cases }}</div></div>
-<div class="metric-card" style="border-left-color:var(--danger)"><label>OPEN CASES</label><div class="metric-num">{{ stats.total_cases }}</div></div>
-<div class="metric-card" style="border-left-color:var(--warning)"><label>HIGH PRIORITY</label><div class="metric-num">0</div></div>
-<div class="metric-card" style="border-left-color:var(--success)"><label>SYSTEM STATUS</label><div class="metric-num" style="font-size:1.1rem;color:var(--success);padding-top:.4rem;">🟢 Online (Modules Active)</div></div>
-</div>
-<div class="card">
-<h3>Recent Cases</h3>
-<table><tr><th>Case ID</th><th>Case Name</th><th>Type</th><th>Location</th><th>Status</th><th>Priority</th><th>Actions</th></tr>
-{% for c in cases %}
-<tr>
-<td><a href="{{ url_for('view_case', case_id=c.case_id) }}">{{ c.case_id }}</a></td>
-<td>{{ c.case_name }}</td><td>{{ c.type }}</td><td>{{ c.location }}</td>
-<td><span class="badge badge-open">{{ c.status }}</span></td>
-<td><span class="badge badge-medium">{{ c.priority }}</span></td>
-<td><a href="{{ url_for('view_case', case_id=c.case_id) }}">View</a></td>
-</tr>
-{% else %}<tr><td colspan="7" style="text-align:center;color:var(--text-muted)">No cases recorded yet. Use Create Case or upload a CSV.</td></tr>{% endfor %}
-</table></div>{% endblock %}""",
+const W=1000, H=650, cx=W/2, cy=H/2, R=Math.min(W,H)/2 - 60; const N = nodes.length; const positions = {}; const degree = {}; nodes.forEach(n=>degree[n.id]=0); edges.forEach(e=>{degree[e.from]=(degree[e.from]||0)+1;degree[e.to]=(degree[e.to]||0)+1;}); nodes.forEach((n,i)=>{ const angle = (2Math.PIi)/Math.max(N,1); positions[n.id] = {x: cx + RMath.cos(angle), y: cy + RMath.sin(angle), deg: degree[n.id]||0}; });
+const typeColor = t => ({ fraud:'#3b82f6', homicide:'#ef4444', robbery:'#f59e0b', arson:'#f97316', burglary:'#a855f7', assault:'#ec4899', theft:'#14b8a6', vandalism:'#84cc16', unknown:'#94a3b8' }[t] || '#94a3b8');
+edges.forEach(e=>{ const a = positions[e.from], b = positions[e.to]; if(!a||!b) return; const line = document.createElementNS('http://www.w3.org/2000/svg','line'); line.setAttribute('x1',a.x); line.setAttribute('y1',a.y); line.setAttribute('x2',b.x); line.setAttribute('y2',b.y); line.setAttribute('stroke', e.color); line.setAttribute('stroke-opacity', Math.max(0.25, Math.min(1, e.value/100))); line.setAttribute('stroke-width', Math.max(1, Math.min(8, e.value/8))); line.classList.add('edge'); const title = document.createElementNS('http://www.w3.org/2000/svg','title'); title.textContent = e.title; line.appendChild(title); line.addEventListener('click', ()=>{ if(e.url) window.location = e.url; }); svg.appendChild(line); });
+nodes.forEach(n=>{ const p = positions[n.id]; const g = document.createElementNS('http://www.w3.org/2000/svg','g'); const c = document.createElementNS('http://www.w3.org/2000/svg','circle'); const size = 12 + Math.min(14, (p.deg||0)*2); c.setAttribute('cx',p.x); c.setAttribute('cy',p.y); c.setAttribute('r',size); c.setAttribute('fill', typeColor(n.group)); c.addEventListener('click', ()=>{ if(n.url) window.location = n.url; }); const title = document.createElementNS('http://www.w3.org/2000/svg','title'); title.textContent = n.title; c.appendChild(title); g.appendChild(c); const t = document.createElementNS('http://www.w3.org/2000/svg','text'); t.setAttribute('x',p.x); t.setAttribute('y',p.y + size + 14); t.setAttribute('text-anchor','middle'); t.textContent = n.id; g.appendChild(t); svg.appendChild(g); }); })();  {% endblock %}"""
+T["evidence_library.html"] = """{% extends "_base.html" %}{% block body %}Evidence library
 
-    "create_case.html": """{% extends "_fallback_base.html" %}{% block body %}
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;">
-<div class="card">
-<h2>Create New Case</h2>
-<form method="post">""" + _CSRF + """
-<label>Case ID *</label><input name="case_id" required placeholder="C001-2026">
-<label>Case Name *</label><input name="case_name" required placeholder="Investigation Title">
-<label>Location</label><input name="location" placeholder="City / District">
-<label>Year</label><input name="year" value="2026">
-<label>Case Type</label><select name="type">{% for t in types %}<option>{{ t }}</option>{% endfor %}</select>
-<label>Status</label><select name="status">{% for s in statuses %}<option>{{ s }}</option>{% endfor %}</select>
-<label>Priority</label><select name="priority">{% for p in priorities %}<option>{{ p }}</option>{% endfor %}</select>
-<label>Initial Confidence (0 - 1)</label><input name="confidence" value="0.5">
-<label>Description</label><textarea name="description" rows="3" placeholder="Case notes..."></textarea>
-<button class="btn">Create Case</button>
-</form></div>
 
-<div class="card">
-<h2>Bulk Import via CSV</h2>
-<p style="color:var(--text-muted);font-size:.9rem;margin-bottom:1rem;">Upload a CSV file with columns: <code>case_id,case_name,location,year,type,status,confidence,description</code> to auto-populate multiple records instantly.</p>
-<form method="post" enctype="multipart/form-data" action="{{ url_for('upload_csv') }}">""" + _CSRF + """
-<label>Select CSV File</label><input type="file" name="csv_file" accept=".csv" required>
-<button class="btn btn-success" style="margin-top:1rem;">Upload & Auto-Populate CSV</button>
-</form></div>
-</div>{% endblock %}""",
 
-    "view_case.html": """{% extends "_fallback_base.html" %}{% block body %}
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
-<h1>{{ case.case_id }} &mdash; {{ case.case_name }}</h1>
-<div>
-<a href="{{ url_for('analyze_case', case_id=case.case_id) }}" class="btn">⚡ Run AI Analysis</a>
-<a href="{{ url_for('export_cases') }}" class="btn" style="background:#475569;margin-left:.5rem;">📥 Export</a>
-</div>
-</div>
-<div class="card">
-<h3>Case Details</h3>
-<p><b>Type:</b> {{ case.type }} | <b>Location:</b> {{ case.location }} | <b>Year:</b> {{ case.year }} | <b>Status:</b> {{ case.status }} | <b>Priority:</b> {{ case.priority }}</p>
-<p><b>Description:</b> {{ case.description or 'No description provided.' }}</p>
-</div>
-<p><a href="{{ url_for('dashboard') }}" style="color:var(--accent-blue)">← Back to Dashboard</a></p>
-{% endblock %}""",
 
-    "analysis.html": """{% extends "_fallback_base.html" %}{% block body %}
-<div class="card">
-<h1>AI & Module Analysis Results: {{ case.case_id }}</h1>
-<pre style="background:#0f172a;padding:1rem;border-radius:6px;border:1px solid var(--border-color);color:#38bdf8;">{{ result | tojson(indent=2) }}</pre>
-<p style="margin-top:1rem;"><a href="{{ url_for('view_case', case_id=case.case_id) }}" class="btn">Back to Case</a></p>
-</div>{% endblock %}""",
 
-    "cross_match.html": """{% extends "_fallback_base.html" %}{% block body %}
-<div class="card">
-<h1>Network & Cross-Case Matcher</h1>
-<p style="color:var(--text-muted)">Select multiple cases below to analyze similarities and network connections.</p>
-<form method="post">""" + _CSRF + """
-<label>Search Command</label><input name="command" value="look for similarities">
-<h3>Select Cases to Compare:</h3>
-<div style="max-height:250px;overflow-y:auto;border:1px solid var(--border-color);padding:1rem;border-radius:6px;background:#0f172a;margin-bottom:1rem;">
-{% for c in cases %}
-<label style="display:flex;align-items:center;gap:.5rem;margin-bottom:.5rem;cursor:pointer;">
-<input type="checkbox" name="case_ids" value="{{ c.case_id }}" style="width:auto;margin:0;" {% if selected and c.case_id in selected %}checked{% endif %}>
-<span><b>{{ c.case_id }}</b> &mdash; {{ c.case_name }} ({{ c.type }})</span>
-</label>
+Clear
+{{ rows|length }} item(s) shown (max 500).
+ID	Case A	Case B	Category	Description	Source	Status	Reliab.	LR	Group	By	Created	{% for r in rows %}
+{{ r.id }}	{{ r.case_a }}
+{{ r.a_name or '' }}	{{ r.case_b }}
+{{ r.b_name or '' }}	{{ r.category }}	{{ r.description }}	{{ r.source }}	{{ r.status }}	{{ '%.2f'|format(r.reliability) }}	{{ '%.2f'|format(r.lr) }}	{{ r.grp or '-' }}	{{ r.created_by }}	{{ r.created }}	Open 
+""" + CSRF + """ {% else %}
+No evidence matches these filters.{% endfor %}
+{% endblock %}""" 
+T["export.html"] = """{% extends "_base.html" %}{% block body %}Export
+All cases CSV All cases JSON
+ID	Name	{% for c in cases %}
+{{ c.case_id }}	{{ c.case_name }}	JSON{% endfor %}
+{% endblock %}""" 
+T["how_it_works.html"] = """{% extends "_base.html" %}{% block body %}How SICCA works
+1. Create cases and record victims. 2. Open Network, pick two cases and set a prior. 3. Add evidence items, each with a source, status and reliability. 4. Read the estimate, its interval and the sensitivity table. 5. Use Matrix for a whole-database view and Graph for the network picture. 6. Read Train ML for the full explanation of the score and its limits.
+{% endblock %}""" 
+T["train.html"] = """{% extends "_base.html" %}{% block body %}
+Train ML and how the score works
+SICCA does not use a black-box model. The score is a transparent Bayesian calculation you can inspect, change and challenge. A machine-learning step exists only as an optional calibration, and only when you have real labelled data. Nothing here is trained by default, and no accuracy is claimed.
+Model status: {% if model %}Calibration trained on {{ model.n }} pairs on {{ model.trained }} (slope {{ '%.2f'|format(model.a) }}, intercept {{ '%.2f'|format(model.b) }}, in-sample Brier {{ '%.3f'|format(model.brier_in_sample) }}). {% else %}No calibration model. Scores are uncalibrated structured estimates.{% endif %}
+Contents
+1 What the score means | 2 Bayes in plain words | 3 The prior | 4 Evidence and likelihood ratios | 5 Status and reliability | 6 Dependent evidence | 7 Putting it together | 8 Worked example | 9 Uncertainty interval | 10 Sensitivity | 11 Baseline rank | 12 Calibration and training | 13 Fact checks | 14 Limits | 15 Glossary
+1. What the score means
+The headline number answers one question: given what has been entered, how likely is it that the two cases share a perpetrator or operating group? It is a degree of belief that is updated by evidence. It is not a measured frequency, not a verdict and not evidence in itself. A weighted average of subjective factor scores (as used in earlier SICCA reports) is not a probability, because it has no baseline and no stated meaning for "0.42". This version replaces it.
+Only the linkage question is scored. "No links whatsoever" is a much wider claim: weak overlaps such as the same region or even the same bar can exist without any common offender. The score measures the strong claim, a shared perpetrator or cell.
+2. Bayes in plain words
+Start with how likely a link was before looking at anything specific (the prior). Then, for each piece of evidence, ask: how much more likely would I see this if the cases were linked than if they were not? That ratio is the likelihood ratio (LR). A ratio of 1 means the evidence says nothing. Above 1 supports a link. Below 1 argues against.
+posterior odds = prior odds x LR1 x LR2 x LR3 ...
+odds = p / (1 - p) and p = odds / (1 + odds)
+Working in odds lets independent pieces of evidence multiply. Two items with LR 2 and 1.5 together give 3.
+3. The prior
+The prior is your starting probability of a shared perpetrator before specific evidence. It should reflect how often two unrelated crimes of this kind in the same area turn out to be committed by the same person or group. For two crimes with very different methods, four years apart, a low prior such as 1 to 3% is reasonable. The default is {{ '%.0f'|format(default_prior*100) }}%.
+The prior matters a lot. A dramatic prior (say 50%) will make almost any evidence look convincing, so always check how the result changes when you move it. If you cannot justify your prior in a sentence, the estimate is only as good as that guess.
+4. Evidence items and default likelihood ratios
+Each item belongs to a category with a default LR, which you can override. These defaults are judgment calls, not measured statistics. They are ordered by how hard the evidence is to explain by chance.
+Category	Default LR	Meaning{% for k,v in cats.items() %}
+{{ k }}	{{ v[0] }}	{{ v[1] }}{% endfor %}
+Why coincidences score 1.0. A shared calendar date, a street name or the number of victims has no causal mechanism: nobody controls when a body is found. Such items are recorded but do not move the estimate unless you give them a reason to. Two events that match by chance are exactly what you would expect to find among many comparable cases.
+Why contradictions matter. Evidence against a link (LR below 1) is recorded just as supportive evidence is. Different cause of death, different method, or a person shown to be elsewhere all belong here.
+5. Status and reliability discount
+Not every claim is equally trustworthy. Before an item is used, its LR is shrunk toward 1 by how much you trust it:
+effective LR = LR ^ (status weight x reliability)
+Status	Weight	Use it when
+verified	{{ sw.verified }}	Primary record: court judgment, forensic report, official file
+witness	{{ sw.witness }}	A named witness said so, not independently confirmed
+unverified	{{ sw.unverified }}	Press repetition, books, rumour with no primary source
+disputed	{{ sw.disputed }}	Sources contradict each other on this point
+Reliability (0 to 1) is your confidence in the specific source. An exponent of 0 gives an effective LR of 1, meaning the item is ignored. An exponent of 1 uses the full LR. This keeps a repeated press claim from counting as much as a court record.
+6. Dependent evidence (no double counting)
+Several items often describe the same underlying fact. "Same region", "same hills" and "same terrain" are really one observation. Give such items the same group name. Within a group, only the item with the largest effect is counted. The table on the Network page shows "no (group)" for items that were set aside. Leaving the group blank treats the item as independent, so use groups when in doubt.
+7. Putting it together
+    1. Convert each item to an effective LR (section 5).
+    2. Keep the strongest item per dependency group (section 6).
+    3. Multiply the remaining LRs to get the combined LR.
+    4. Multiply by the prior odds and convert back to a probability.
+The system also adds a few automatic items from the case records (same crime type, location text overlap, long time gap). These are weak by design and labelled auto.
+8. Worked example (calculated live)
+Prior {{ '%.0f'|format(ex.prior*100) }}%. Two items: a bar that a witness placed at both scenes (LR 2, witness, reliability 0.8), and a shared terrain (LR 1.5, verified, reliability 1.0).
+Item	LR	Exponent	Effective LR {% for i in ex['items'] %}
+{{ i.description }}	{{ i.lr }}	{{ '%.2f'|format(i.w) }}	{{ '%.3f'|format(i.elr) }}{% endfor %}
+Combined LR {{ '%.3f'|format(ex.combined_lr) }}. Estimate {{ '%.1f'|format(ex.post*100) }}%, 90% interval {{ '%.1f'|format(ex.p5*100) }}% to {{ '%.1f'|format(ex.p95*100) }}%. Two modest, partly trusted items lift a 2% prior only to about {{ '%.0f'|format(ex.post*100) }}%: a link stays unlikely unless strong, verified evidence appears.
+9. Uncertainty interval
+A single number hides how unsure the inputs are. The interval comes from a Monte Carlo simulation of {{ n_mc }} runs: each run jitters the prior (log-normal, spread 0.5) and every counted LR (in log space). Weakly trusted items are jittered more, strongly verified items less. The 5th to 95th percentile of the results is the 90% interval. A wide interval means the conclusion depends on soft inputs and should not be quoted as a precise figure.
+10. Sensitivity
+The sensitivity table removes each counted item in turn and reports how many percentage points the estimate changes. It shows which single claim carries the result. If one unverified item drives everything, verifying that item is the most valuable next step.
+11. Baseline rank
+A score only means something relative to what unrelated cases would score. The rank compares this pair's combined evidence with every other case pair in the database. With fewer than 10 pairs the figure is hidden, because a small library cannot show what "random" looks like. Load more unrelated cases from the same region to make the baseline useful. Note that records you entered yourself share your biases: a pair you studied closely will always look richer than pairs you did not.
+12. Calibration and training
+Calibration checks whether "30%" actually means about 3 in 10. It requires labelled pairs: cases where the truth about linkage is known (for example solved cases with confirmed common or separate offenders). SICCA then fits a one-dimensional logistic curve (Platt scaling) p = 1 / (1 + exp(-(a x log-odds + b))) by gradient descent and reports an in-sample Brier score (mean squared error of the probabilities; lower is better, 0.25 is a coin flip). The fitted values are saved as signed JSON, never as a pickle file, so a tampered file is rejected.
+Requirements: a CSV with columns log_odds (the natural log of the posterior odds from this tool) and label (1 if the pair was truly linked, 0 if not), at least 30 rows and both labels present. With the two or three cases you may have now, do not train: any fitted curve would be noise. The in-sample Brier score is optimistic; validate on held-out pairs before relying on it.
+{% if current_user.is_admin() %}
+""" + CSRF + """
 {% else %}
-<p style="color:var(--text-muted)">No cases available for network comparison.</p>
-{% endfor %}
-</div>
-<button class="btn">Run Cross-Match Analysis</button>
-</form>
-{% if error %}<p class="flash error" style="margin-top:1rem;">{{ error }}</p>{% endif %}
-{% if result %}<h3>Results</h3><pre style="color:#38bdf8;background:#0f172a;padding:1rem;border-radius:6px;">{{ result | tojson(indent=2) }}</pre>{% endif %}
-</div>{% endblock %}""",
+Only administrators can train.
+{% endif %}
+13. Automatic fact checks
+When you open a case or a comparison, SICCA compares your description text with the structured data and warns about mismatches, such as a description saying the victims were girls while a male victim is recorded, or a stated victim count that differs from the victims entered. These checks catch typing and copy errors; they do not verify facts against the outside world.
+14. Limits and misuse
+    • Every LR and prior is a human judgment. The output is as good as those judgments and the sources behind them. 
+    • Items are only partly independent even with groups; the product can overstate certainty. 
+    • Press accounts often copy each other. Ten articles repeating one claim are still one claim: give them one group and an unverified status. 
+    • Anchoring risk: once a link feels plausible, it is easy to add supportive items and skip contradicting ones. Record contradictions too. 
+    • A low estimate does not prove cases are unrelated, and a high one does not prove they are related. Neither is evidence in a legal sense. 
+    • Do not name or accuse individuals on the basis of this score.
+15. Glossary
+Prior	Probability before specific evidence.
+Odds	p / (1 - p). 2% is odds of about 0.02 to 1.
+Likelihood ratio	How much likelier the evidence is if the cases are linked than if not.
+Posterior	Probability after combining prior and evidence.
+Calibration	Whether stated probabilities match real frequencies.
+Brier score	Mean squared error between probabilities and outcomes.
+Monte Carlo	Repeated random re-runs to see how results vary with uncertain inputs.
+Base rate	How often something happens in comparable situations overall.
+{% endblock %}""" 
+============================== APP ==============================
+def create_app() -> Flask: init_db() app = Flask(name) app.jinja_loader = DictLoader(T) app.config.update(SECRET_KEY=secret_key(), MAX_CONTENT_LENGTH=Config.MAX_CONTENT_LENGTH, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_SECURE=Config.SECURE_COOKIE, WTF_CSRF_ENABLED=True) CSRFProtect(app) login_manager.init_app(app) login_manager.login_view = "login"
+def get_case(conn, cid: str) -> Dict[str, Any]:
+    r = conn.execute("SELECT * FROM cases WHERE case_id=?", (cid,)).fetchone()
+    if not r:
+        abort(404)
+    return dict(r)
 
-    "export.html": """{% extends "_fallback_base.html" %}{% block body %}
-<div class="card">
-<h1>Export Cases & Analytical Reports</h1>
-<p style="color:var(--text-muted)">Export case data in multiple formats for reporting, analysis, or archiving.</p>
-<hr style="border-color:var(--border-color);margin:1.5rem 0;">
-<h3>Bulk Export Options</h3>
-<div style="display:flex;gap:1rem;margin-top:1rem;">
-<a href="{{ url_for('export_bulk', fmt='csv') }}" class="btn btn-success">📥 Export All as CSV</a>
-<a href="{{ url_for('export_bulk', fmt='json') }}" class="btn" style="background:#0284c7;">📥 Export All as JSON</a>
-</div>
-<h3 style="margin-top:2rem;">Individual Case Exports</h3>
-<table><tr><th>Case ID</th><th>Case Name</th><th>Type</th><th>Actions</th></tr>
-{% for c in cases %}
-<tr>
-<td>{{ c.case_id }}</td><td>{{ c.case_name }}</td><td>{{ c.type }}</td>
-<td><a href="{{ url_for('export_single', case_id=c.case_id, fmt='json') }}">Download JSON</a></td>
-</tr>
-{% endfor %}
-</table>
-</div>{% endblock %}""",
+def victims_of(conn, cid: str) -> List[Dict[str, Any]]:
+    return [dict(r) for r in conn.execute("SELECT * FROM victims WHERE case_id=? ORDER BY id", (cid,))]
 
-    "train.html": """{% extends "_fallback_base.html" %}{% block body %}
-<div style="display:grid;grid-template-columns:1.2fr 0.8fr;gap:1.5rem;">
-<div class="card">
-<h2>Train Machine Learning Model</h2>
-<p style="color:var(--text-muted);font-size:.9rem;">Upload a historical CSV dataset with labels to train the ML model for better risk predictions.</p>
-<form method="post" enctype="multipart/form-data">""" + _CSRF + """
-<label>Training CSV File</label><input type="file" name="training_csv" accept=".csv" required>
-<button class="btn" style="margin-top:1rem;">Upload & Train Model</button>
-</form></div>
-
-<div class="card" style="background:#0f172a;">
-<h3>ℹ️ How ML Training Works</h3>
-<ul style="color:var(--text-muted);font-size:.9rem;line-height:1.6;padding-left:1.2rem;">
-<li><b>Algorithm:</b> Logistic Regression with OneHot encoding.</li>
-<li><b>Features Used:</b> Case type, location, year, evidence count, suspects count, Bayesian scores.</li>
-<li><b>Hybrid Scoring:</b> Combines Bayesian prior probabilities (60%) with ML pattern classification (40%).</li>
-<li><b>Advanced Modules:</b> Weather, Temporal, MO, and Calibration active status: $\\text{Active}$</li>
-</ul>
-</div></div>{% endblock %}""",
-
-    "how_it_works.html": """{% extends "_fallback_base.html" %}{% block body %}
-<div class="card" style="max-width:900px;margin:auto;">
-<h1>? How SICCA Works</h1>
-<p style="color:var(--text-muted)">Learn how to effectively use the SICCA platform for comprehensive case management and analysis.</p>
-<hr style="border-color:var(--border-color);margin:1.5rem 0;">
-<h3>1. Case Creation & CSV Import</h3>
-<p>Create cases manually or upload a CSV dataset to auto-populate multiple records instantly.</p>
-<h3>2. AI-Powered Hybrid Analysis</h3>
-<p>Leverages hybrid Bayesian probability analysis, machine learning algorithms, and advanced plugin modules (Weather, Temporal, MO, Calibration) to generate robust risk assessments.</p>
-<h3>3. Network & Cross-Matching</h3>
-<p>Select multiple cases in the Network tab to visualize connections, shared attributes, and similarity scores.</p>
-<h3>4. Secure Export & Reporting</h3>
-<p>Generate comprehensive reports and bulk exports in CSV or JSON format.</p>
-<p style="margin-top:2rem;"><a href="{{ url_for('dashboard') }}" class="btn">Return to Dashboard</a></p>
-</div>{% endblock %}"""
-}
-
-
-def build_template_loader():
-    return ChoiceLoader([DictLoader(FALLBACK_TEMPLATES)]), {}
-
-
-# =============================================================================
-# FLASK APP FACTORY
-# =============================================================================
-
-def create_app() -> Flask:
-    Config.ensure_dirs()
-    init_db()
-
-    app = Flask(__name__, template_folder=None, static_folder=str(Config.APP_ROOT / "static"))
-    app.jinja_loader, _ = build_template_loader()
-    app.config.update(
-        SECRET_KEY=load_or_create_secret_key(),
-        MAX_CONTENT_LENGTH=Config.MAX_CONTENT_LENGTH,
-        SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE="Lax",
-        SESSION_COOKIE_SECURE=False,
-        WTF_CSRF_ENABLED=True,
-    )
-    CSRFProtect(app)
-    login_manager.init_app(app)
-    login_manager.login_view = "login"
-
-    ml = MLModel(Config.MODEL_PATH, Config.MODEL_HASH_PATH)
-
-    @app.route("/login", methods=["GET", "POST"])
-    def login():
-        if current_user.is_authenticated:
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    if request.method == "POST":
+        u = clean(request.form.get("username"), 100)
+        key = f"{request.remote_addr}:{u}"
+        if locked_out(key):
+            flash("Too many attempts. Try again in 10 minutes.", "error")
+            return render_template("login.html"), 429
+        with db() as c:
+            r = c.execute("SELECT * FROM users WHERE username=?", (u,)).fetchone()
+        if r and check_password_hash(r["password"], request.form.get("password", "")):
+            login_user(User(r["id"], r["username"], r["role"]))
             return redirect(url_for("dashboard"))
-        if request.method == "POST":
-            username = clean_text(request.form.get("username"), 100)
-            password = request.form.get("password", "")
-            with db() as conn:
-                row = conn.execute("SELECT id, username, password, role FROM users WHERE username = ?", (username,)).fetchone()
-            if row and check_password_hash(row["password"], password):
-                login_user(User(row["id"], row["username"], row["role"]))
-                session.permanent = True
-                return redirect(url_for("dashboard"))
-            flash("Invalid credentials", "error")
-            return render_template("login.html"), 401
-        return render_template("login.html")
+        FAILS.setdefault(key, []).append(time.time())
+        flash("Invalid credentials.", "error")
+        return render_template("login.html"), 401
+    return render_template("login.html")
 
-    @app.route("/logout", methods=["POST"])
-    @login_required
-    def logout():
-        logout_user()
-        session.clear()
-        return redirect(url_for("login"))
+@app.route("/logout", methods=["POST"])
+@login_required
+def logout():
+    logout_user()
+    session.clear()
+    return redirect(url_for("login"))
 
-    @app.route("/")
-    @login_required
-    def index():
-        return redirect(url_for("dashboard"))
+@app.route("/")
+@login_required
+def index():
+    return redirect(url_for("dashboard"))
 
-    @app.route("/dashboard")
-    @login_required
-    def dashboard():
-        with db() as conn:
-            rows = conn.execute("SELECT * FROM cases ORDER BY modified DESC LIMIT 100").fetchall()
-            total = conn.execute("SELECT COUNT(*) AS n FROM cases").fetchone()["n"]
-        return render_template("dashboard.html", cases=[dict(r) for r in rows], stats={"total_cases": total})
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM cases ORDER BY modified DESC LIMIT 100")]
+        s = {"total": c.execute("SELECT COUNT(*) n FROM cases").fetchone()["n"],
+             "open": c.execute("SELECT COUNT(*) n FROM cases WHERE status IN ('open','under investigation','unsolved')").fetchone()["n"],
+             "high": c.execute("SELECT COUNT(*) n FROM cases WHERE priority='high'").fetchone()["n"],
+             "evidence": c.execute("SELECT COUNT(*) n FROM link_evidence").fetchone()["n"]}
+    return render_template("dashboard.html", cases=rows, s=s)
 
-    @app.route("/how-it-works")
-    @login_required
-    def how_it_works():
-        return render_template("how_it_works.html")
+@app.route("/how-it-works")
+@login_required
+def how_it_works():
+    return render_template("how_it_works.html")
 
-    @app.route("/export")
-    @login_required
-    def export_cases():
-        with db() as conn:
-            rows = conn.execute("SELECT case_id, case_name, type FROM cases").fetchall()
-        return render_template("export.html", cases=[dict(r) for r in rows])
+def validated_case(f) -> Dict[str, Any]:
+    cid, name = clean(f.get("case_id"), 50), clean(f.get("case_name"), 200)
+    if not cid or not name:
+        raise ValueError("Case ID and name are required.")
+    if not re.fullmatch(r"[\w\-. ]+", cid):
+        raise ValueError("Case ID may contain letters, digits, space, - _ . only.")
+    try:
+        year = int(float(f.get("year") or datetime.now().year))
+    except (TypeError, ValueError):
+        raise ValueError("Year must be a number.")
+    if not 1800 <= year <= 2100:
+        raise ValueError("Year out of range.")
+    return {"case_id": cid, "case_name": name, "location": clean(f.get("location"), 200), "year": year,
+            "type": pick(f.get("type"), CASE_TYPES, "unknown"),
+            "status": pick(f.get("status"), STATUSES, "open"),
+            "priority": pick(f.get("priority"), PRIORITIES, "medium"),
+            "description": clean(f.get("description"), 5000)}
 
-    @app.route("/export/bulk/<fmt>")
-    @login_required
-    def export_bulk(fmt: str):
-        with db() as conn:
-            rows = [dict(r) for r in conn.execute("SELECT * FROM cases").fetchall()]
-        if fmt == "json":
-            return Response(json.dumps(rows, indent=2), mimetype="application/json",
-                            headers={"Content-Disposition": "attachment;filename=sicca_cases.json"})
-        
-        output = io.StringIO()
-        if rows:
-            writer = csv.DictWriter(output, fieldnames=rows[0].keys())
-            writer.writeheader()
-            writer.writerows(rows)
-        return Response(output.getvalue(), mimetype="text/csv",
-                        headers={"Content-Disposition": "attachment;filename=sicca_cases.csv"})
+def insert_case(conn, d: Dict[str, Any], replace: bool = False) -> bool:
+    t = now_iso()
+    cur = conn.execute(
+        f"INSERT OR {'REPLACE' if replace else 'IGNORE'} INTO cases(case_id,case_name,location,year,type,status,priority,description,created_by,created,modified) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (d["case_id"], d["case_name"], d["location"], d["year"], d["type"], d["status"],
+         d["priority"], d["description"], current_user.username, t, t))
+    return cur.rowcount > 0
 
-    @app.route("/export/single/<case_id>/<fmt>")
-    @login_required
-    def export_single(case_id: str, fmt: str):
-        with db() as conn:
-            row = conn.execute("SELECT * FROM cases WHERE case_id = ?", (case_id,)).fetchone()
-        if not row:
-            abort(404)
-        return Response(json.dumps(dict(row), indent=2), mimetype="application/json",
-                        headers={"Content-Disposition": f"attachment;filename={case_id}.json"})
+@app.route("/create_case", methods=["GET", "POST"])
+@login_required
+def create_case():
+    def page(code=200):
+        return render_template("create_case.html", types=CASE_TYPES, statuses=STATUSES,
+                               priorities=PRIORITIES, year=datetime.now().year), code
+    if request.method == "GET":
+        return page()
+    try:
+        d = validated_case(request.form)
+        with db() as c:
+            if not insert_case(c, d):
+                raise ValueError(f"Case {d['case_id']} already exists.")
+        flash(f"Case {d['case_id']} created.", "success")
+        return redirect(url_for("view_case", case_id=d["case_id"]))
+    except ValueError as e:
+        flash(str(e), "error")
+        return page(400)
 
-    @app.route("/create_case", methods=["GET", "POST"])
-    @login_required
-    def create_case():
-        if request.method == "GET":
-            return render_template("create_case.html", types=CASE_TYPES, statuses=STATUSES, priorities=PRIORITIES)
+@app.route("/upload_csv", methods=["POST"])
+@login_required
+def upload_csv():
+    f = request.files.get("csv_file")
+    if not f:
+        flash("No file provided.", "error")
+        return redirect(url_for("create_case"))
+
+    raw = f.read()
+    LOG.info("=== upload_csv DEBUG ===")
+    LOG.info("filename=%r size=%d bytes", f.filename, len(raw))
+    LOG.info("first 16 bytes=%r", raw[:16])
+    LOG.info("first 300 chars=%r", raw[:300].decode("utf-8", errors="replace"))
+
+    if not raw.strip():
+        flash("The uploaded file is empty.", "error")
+        return redirect(url_for("create_case"))
+
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
         try:
-            case_id = clean_text(request.form.get("case_id"), 50)
-            case_name = clean_text(request.form.get("case_name"), 200)
-            if not case_id or not case_name:
-                raise ValueError("Case ID and Name are required.")
-            now = now_iso()
-            with db() as conn:
-                conn.execute(
-                    """INSERT INTO cases (case_id, case_name, location, year, type, status, confidence, 
-                    suspects_count, evidence_count, description, priority, created_by, created, modified)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (case_id, case_name, clean_text(request.form.get("location"), 200),
-                     int(request.form.get("year", 2026)), request.form.get("type", "unknown"),
-                     request.form.get("status", "open"), float(request.form.get("confidence", 0.5)),
-                     0, 0, clean_text(request.form.get("description"), 5000),
-                     request.form.get("priority", "medium"), current_user.username, now, now)
-                )
-            flash(f"Case {case_id} successfully created.", "success")
-            return redirect(url_for("view_case", case_id=case_id))
-        except Exception as exc:
-            flash(str(exc), "error")
-            return render_template("create_case.html", types=CASE_TYPES, statuses=STATUSES, priorities=PRIORITIES), 400
-
-    @app.route("/upload_csv", methods=["POST"])
-    @login_required
-    def upload_csv():
-        f = request.files.get("csv_file")
-        if not f:
-            flash("No CSV file provided.", "error")
+            text = raw.decode("latin-1")
+            LOG.info("upload_csv: file decoded as latin-1 fallback")
+        except Exception as e:
+            flash(f"Could not decode file: {e}", "error")
             return redirect(url_for("create_case"))
+
+    # Strip a possible leading 'sep=,' line (Excel/LibreOffice quirk)
+    lines = text.splitlines()
+    if lines and lines[0].lower().startswith("sep="):
+        LOG.info("upload_csv: stripping 'sep=' line: %r", lines[0])
+        text = "\n".join(lines[1:])
+
+    try:
+        df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False)
+    except Exception as e:
+        LOG.info("upload_csv: pandas read failed: %s", e)
+        flash(f"Could not read CSV: {e}", "error")
+        return redirect(url_for("create_case"))
+
+    # Normalize header: strip whitespace and BOM leftovers
+    df.columns = [str(c).lstrip("\ufeff").strip() for c in df.columns]
+    LOG.info("upload_csv: columns=%r rows=%d", list(df.columns), len(df))
+
+    if len(df) == 0:
+        flash("The CSV has a header but no data rows.", "error")
+        return redirect(url_for("create_case"))
+
+    if not {"case_id", "case_name"} <= set(df.columns):
+        flash(f"CSV needs columns case_id and case_name. Found: {list(df.columns)}", "error")
+        return redirect(url_for("create_case"))
+
+    ok, errs = 0, []
+    with db() as c:
+        for i, row in df.iterrows():
+            rd = row.to_dict()
+            # Normalize keys too
+            rd = {str(k).lstrip("\ufeff").strip(): v for k, v in rd.items()}
+            LOG.info("upload_csv: row %d raw=%r", i + 2, rd)
+            try:
+                d = validated_case(rd)
+                LOG.info("upload_csv: row %d validated=%r", i + 2, d)
+                inserted = insert_case(c, d)
+                LOG.info("upload_csv: row %d inserted=%s", i + 2, inserted)
+                if inserted:
+                    ok += 1
+                else:
+                    errs.append(f"row {i + 2}: case_id '{d['case_id']}' already exists.")
+            except ValueError as e:
+                LOG.info("upload_csv: row %d rejected: %s", i + 2, e)
+                errs.append(f"row {i + 2}: {e}")
+
+    flash(f"Imported {ok} new case(s); skipped {len(df) - ok}.", "success" if ok else "error")
+    for e in errs[:10]:
+        flash(e, "error")
+    return redirect(url_for("dashboard"))
+
+@app.route("/case/<case_id>")
+@login_required
+def view_case(case_id: str):
+    with db() as c:
+        case, vs = get_case(c, case_id), victims_of(c, case_id)
+    return render_template("view_case.html", c=case, victims=vs, warns=fact_check(case, vs))
+
+@app.route("/case/<case_id>/victim", methods=["POST"])
+@login_required
+def add_victim(case_id: str):
+    name, sex = clean(request.form.get("name"), 100), request.form.get("sex", "U")
+    age = request.form.get("age", "")
+    try:
+        age_v = int(age) if age else None
+        if not name or sex not in ("F", "M", "U") or (age_v is not None and not 0 <= age_v <= 110):
+            raise ValueError
+    except ValueError:
+        flash("Invalid victim data.", "error")
+        return redirect(url_for("view_case", case_id=case_id))
+    with db() as c:
+        get_case(c, case_id)
+        c.execute("INSERT INTO victims(case_id,name,sex,age) VALUES(?,?,?,?)",
+                  (case_id, name, sex, age_v))
+    return redirect(url_for("view_case", case_id=case_id))
+
+def parse_prior(v) -> float:
+    try:
+        return min(0.5, max(0.001, float(v)))
+    except (TypeError, ValueError):
+        return Config.DEFAULT_PRIOR
+
+@app.route("/cross_match")
+@login_required
+def compare():
+    a, b = clean(request.args.get("a"), 50), clean(request.args.get("b"), 50)
+    prior = parse_prior(request.args.get("prior"))
+    ctx: Dict[str, Any] = {"prior": prior, "sel_a": a, "sel_b": b, "r": None,
+                           "cats": CATEGORIES, "statuses": STATUS_W}
+    with db() as c:
+        ctx["cases"] = [dict(r) for r in c.execute("SELECT case_id,case_name FROM cases ORDER BY modified DESC")]
+        if a and b:
+            if a == b:
+                ctx["error"] = "Choose two different cases."
+            else:
+                A, B = get_case(c, a), get_case(c, b)
+                r = assess(pair_items(c, A, B), prior, seed="|".join(sorted((a, b))))
+                model = load_calibration()
+                ctx.update(r=r, A=A, B=B, base=baseline(c, r["total_log"]),
+                           cal=calibrated(r["post"], model), cal_on=bool(model),
+                           warns=fact_check(A, victims_of(c, a)) + fact_check(B, victims_of(c, b)))
+    return render_template("compare.html", **ctx)
+
+@app.route("/matrix")
+@login_required
+def matrix():
+    prior = parse_prior(request.args.get("prior"))
+    try:
+        floor = float(request.args.get("floor", 5.0))
+    except (TypeError, ValueError):
+        floor = 5.0
+    floor = max(0.0, min(100.0, floor))
+    with db() as c:
+        cases = [dict(r) for r in c.execute("SELECT case_id,case_name FROM cases ORDER BY case_id")]
+        scores = pairwise_scores(c, prior)
+    cell: Dict[tuple, Dict[str, float]] = {}
+    row_max: Dict[str, float] = {cs["case_id"]: 0.0 for cs in cases}
+    global_max = 0.0
+    for (a, b), r in scores.items():
+        pct = r["post"] * 100.0
+        cell[(a, b)] = {"pct": pct, "p5": r["p5"] * 100.0,
+                        "p95": r["p95"] * 100.0, "lr": r["combined_lr"]}
+        if pct > row_max.get(a, 0):
+            row_max[a] = pct
+        if pct > row_max.get(b, 0):
+            row_max[b] = pct
+        if pct > global_max:
+            global_max = pct
+    cases.sort(key=lambda cs: -row_max.get(cs["case_id"], 0.0))
+    return render_template("matrix.html", cases=cases, cell=cell, prior=prior,
+                           floor=floor, row_max=row_max, global_max=global_max)
+
+@app.route("/network_graph")
+@login_required
+def network_graph():
+    prior = parse_prior(request.args.get("prior"))
+    try:
+        floor = float(request.args.get("floor", 10.0))
+    except (TypeError, ValueError):
+        floor = 10.0
+    floor = max(0.0, min(100.0, floor))
+    with db() as c:
+        cases = [dict(r) for r in c.execute("SELECT case_id,case_name,type,status,priority FROM cases ORDER BY case_id")]
+        scores = pairwise_scores(c, prior)
+    nodes = [{"id": cs["case_id"],
+              "label": cs["case_id"],
+              "title": f"{cs['case_id']}: {cs['case_name']} | Type: {cs['type']} | Status: {cs['status']} | Priority: {cs['priority']}",
+              "group": cs["type"],
+              "url": url_for("view_case", case_id=cs["case_id"])} for cs in cases]
+    edges = []
+    for (a, b), r in scores.items():
+        pct = r["post"] * 100.0
+        if pct < floor:
+            continue
+        hue = 120 * (1 - min(1.0, pct / 100.0))
+        edges.append({"from": a, "to": b, "value": pct,
+                      "title": f"{a} and {b}: {pct:.1f}% posterior, LR {r['combined_lr']:.2f}x",
+                      "url": url_for("compare", a=a, b=b, prior=prior),
+                      "color": f"hsl({hue:.0f},65%,50%)"})
+    return render_template("network_graph.html", prior=prior, floor=floor,
+                           n_nodes=len(nodes), n_edges=len(edges),
+                           nodes_json=json.dumps(nodes), edges_json=json.dumps(edges))
+
+@app.route("/evidence")
+@login_required
+def evidence_library():
+    status = clean(request.args.get("status"), 20)
+    cat = clean(request.args.get("category"), 40)
+    q = clean(request.args.get("q"), 100)
+    min_lr = request.args.get("min_lr", "")
+    grp = clean(request.args.get("grp"), 40)
+    sql = ("SELECT e.*, a.case_name AS a_name, b.case_name AS b_name "
+           "FROM link_evidence e "
+           "LEFT JOIN cases a ON a.case_id = e.case_a "
+           "LEFT JOIN cases b ON b.case_id = e.case_b "
+           "WHERE 1=1")
+    params: List[Any] = []
+    if status and status in STATUS_W:
+        sql += " AND e.status = ?"; params.append(status)
+    if cat and cat in CATEGORIES:
+        sql += " AND e.category = ?"; params.append(cat)
+    if grp:
+        sql += " AND e.grp = ?"; params.append(grp)
+    if q:
+        sql += " AND (e.description LIKE ? OR e.source LIKE ? OR e.created_by LIKE ?)"
+        like = f"%{q}%"; params += [like, like, like]
+    if min_lr:
         try:
-            df = pd.read_csv(f.stream)
-            count = 0
-            now = now_iso()
-            with db() as conn:
-                for _, row in df.iterrows():
-                    cid = clean_text(row.get("case_id"), 50)
-                    cname = clean_text(row.get("case_name"), 200)
-                    if not cid or not cname:
-                        continue
-                    conn.execute(
-                        """INSERT OR REPLACE INTO cases (case_id, case_name, location, year, type, status, confidence, 
-                        suspects_count, evidence_count, description, priority, created_by, created, modified)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (cid, cname, clean_text(row.get("location"), 200),
-                         int(row.get("year", 2026)), clean_text(row.get("type"), "unknown"),
-                         clean_text(row.get("status"), "open"), float(row.get("confidence", 0.5)),
-                         0, 0, clean_text(row.get("description"), 5000),
-                         clean_text(row.get("priority"), "medium"), current_user.username, now, now)
-                    )
-                    count += 1
-            flash(f"Successfully imported {count} cases from CSV.", "success")
-        except Exception as exc:
-            flash(f"CSV Import failed: {exc}", "error")
-        return redirect(url_for("dashboard"))
+            v = float(min_lr); sql += " AND e.lr >= ?"; params.append(v)
+        except ValueError:
+            pass
+    sql += " ORDER BY e.created DESC LIMIT 500"
+    with db() as c:
+        rows = [dict(r) for r in c.execute(sql, params).fetchall()]
+    return render_template("evidence_library.html", rows=rows, cats=CATEGORIES,
+                           statuses=STATUS_W, f={"status": status, "category": cat,
+                           "q": q, "min_lr": min_lr, "grp": grp})
 
-    @app.route("/case/<case_id>")
-    @login_required
-    def view_case(case_id: str):
-        with db() as conn:
-            row = conn.execute("SELECT * FROM cases WHERE case_id = ?", (case_id,)).fetchone()
-        if not row:
-            abort(404)
-        return render_template("view_case.html", case=dict(row))
+def back(a, b, prior):
+    return redirect(url_for("compare", a=a, b=b, prior=prior))
 
-    @app.route("/cross_match", methods=["GET", "POST"])
-    @login_required
-    def cross_match_route():
-        with db() as conn:
-            rows = conn.execute("SELECT case_id, case_name, type FROM cases ORDER BY modified DESC").fetchall()
-        cases = [dict(r) for r in rows]
-        
-        if request.method == "POST":
-            ids = request.form.getlist("case_ids")
-            if len(ids) < 2:
-                return render_template("cross_match.html", cases=cases, selected=ids, error="Please select at least two cases to compare.")
-            
-            matches = []
-            for a_id, b_id in combinations(ids, 2):
-                matches.append({
-                    "case_a": a_id,
-                    "case_b": b_id,
-                    "similarity": 0.78,
-                    "level": "strong",
-                    "shared": ["Similar crime type", "Overlapping location tags"]
-                })
-            result = {"cases_compared": len(ids), "matches": matches}
-            return render_template("cross_match.html", cases=cases, selected=ids, result=result)
+@app.route("/evidence/add", methods=["POST"])
+@login_required
+def add_evidence():
+    f = request.form
+    a, b = clean(f.get("a"), 50), clean(f.get("b"), 50)
+    try:
+        cat = f.get("category")
+        if cat not in CATEGORIES or f.get("status") not in STATUS_W or not clean(f.get("description"), 300):
+            raise ValueError
+        rel = float(f.get("reliability") or 0.7)
+        lr = float(f.get("lr")) if clean(f.get("lr")) else CATEGORIES[cat][0]
+        if not (0 <= rel <= 1 and 0.01 <= lr <= 1000) or not math.isfinite(lr + rel):
+            raise ValueError
+    except (TypeError, ValueError):
+        flash("Invalid evidence: check category, status, reliability (0-1) and LR (0.01-1000).", "error")
+        return back(a, b, f.get("prior"))
+    x, y = sorted((a, b))
+    with db() as c:
+        get_case(c, x), get_case(c, y)
+        c.execute("INSERT INTO link_evidence(case_a,case_b,category,description,source,status,reliability,lr,grp,created_by,created) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (x, y, cat, clean(f.get("description"), 300), clean(f.get("source"), 300),
+                   f["status"], rel, lr, clean(f.get("grp"), 40).lower(),
+                   current_user.username, now_iso()))
+    return back(a, b, f.get("prior"))
 
-        return render_template("cross_match.html", cases=cases, selected=[], result=None)
+@app.route("/evidence/<int:eid>/delete", methods=["POST"])
+@login_required
+def delete_evidence(eid: int):
+    with db() as c:
+        c.execute("DELETE FROM link_evidence WHERE id=?", (eid,))
+    return back(request.form.get("a"), request.form.get("b"), request.form.get("prior"))
 
-    @app.route("/analyze/<case_id>")
-    @login_required
-    def analyze_case(case_id: str):
-        with db() as conn:
-            row = conn.execute("SELECT * FROM cases WHERE case_id = ?", (case_id,)).fetchone()
-        if not row:
-            abort(404)
-        
-        # Integrate module status checks in analysis payload if available
-        module_status = {
-            "calibration": calib is not None,
-            "temporal": temporal is not None,
-            "weather": weather is not None,
-            "mo": mo is not None,
-            "linkage": linkage is not None,
-            "conditions": conditions is not None
-        }
-        result = {
-            "risk_score": 0.72, 
-            "risk_level": "medium", 
-            "confidence": 0.80,
-            "modules_loaded": module_status
-        }
-        return render_template("analysis.html", case=dict(row), result=result)
+@app.route("/analyze/<case_id>")
+@login_required
+def analyze_case(case_id: str):
+    return redirect(url_for("view_case", case_id=case_id))
 
-    @app.route("/admin/train", methods=["GET", "POST"])
-    @login_required
-    def train_model():
-        if request.method == "POST":
-            f = request.files.get("training_csv")
-            if f:
-                ml.train(pd.DataFrame())
-                flash("Model trained successfully.", "success")
-        return render_template("train.html")
+@app.route("/export")
+@login_required
+def export_cases():
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT case_id,case_name FROM cases")]
+    return render_template("export.html", cases=rows)
 
-    return app
+@app.route("/export/bulk/<fmt>")
+@login_required
+def export_bulk(fmt: str):
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM cases")]
+    if fmt == "json":
+        return Response(json.dumps(rows, indent=2), mimetype="application/json",
+                        headers={"Content-Disposition": "attachment; filename=sicca_cases.json"})
+    out = io.StringIO()
+    if rows:
+        w = csv.DictWriter(out, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows([{k: safe_cell(v) for k, v in r.items()} for r in rows])
+    return Response(out.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=sicca_cases.csv"})
 
+@app.route("/export/single/<case_id>/<fmt>")
+@login_required
+def export_single(case_id: str, fmt: str):
+    with db() as c:
+        case = get_case(c, case_id)
+        case["victims"] = victims_of(c, case_id)
+    name = secure_filename(case_id) or "case"
+    return Response(json.dumps(case, indent=2), mimetype="application/json",
+                    headers={"Content-Disposition": f"attachment; filename={name}.json"})
 
-def main():
-    init_db()
-    create_app().run(host=Config.HOST, port=Config.PORT, debug=Config.DEBUG)
+@app.route("/admin/train", methods=["GET", "POST"])
+@login_required
+def train_model():
+    if request.method == "POST":
+        if not current_user.is_admin():
+            abort(403)
+        f = request.files.get("training_csv")
+        try:
+            m = train_calibration(pd.read_csv(f.stream))
+            flash(f"Calibration fitted on {m['n']} pairs (in-sample Brier {m['brier_in_sample']:.3f}). Validate on held-out data.", "success")
+        except Exception as e:
+            flash(f"Training failed: {e}", "error")
+        return redirect(url_for("train_model"))
+    ex_items = [
+        {"category": "witness_overlap", "description": "Bar placed at both scenes by a witness",
+         "lr": 2.0, "status": "witness", "reliability": 0.8, "grp": ""},
+        {"category": "shared_region", "description": "Shared terrain",
+         "lr": 1.5, "status": "verified", "reliability": 1.0, "grp": ""},
+    ]
+    return render_template("train.html", model=load_calibration(), cats=CATEGORIES, sw=STATUS_W,
+                           default_prior=Config.DEFAULT_PRIOR,
+                           ex=assess(ex_items, Config.DEFAULT_PRIOR, "example"),
+                           n_mc=Config.MC_SAMPLES)
 
-
-if __name__ == "__main__":
-    sys.exit(main())
+return app
+def main(): create_app().run(host=Config.HOST, port=Config.PORT, debug=Config.DEBUG)
+if name == "main": sys.exit(main())
